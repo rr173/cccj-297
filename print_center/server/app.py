@@ -10,8 +10,9 @@ from fastapi.responses import JSONResponse
 
 from . import service
 from .db import connect, init_db
-from .models import (ArrivalIn, CreateJobIn, DeactivationIn, NoPaperIn,
-                     ReassignBatchIn, ReceiptIn, RegisterAgentIn,
+from .models import (ArrivalIn, CreateJobIn, CreditPickupIn,
+                     DeactivationIn, NoPaperIn, ReassignBatchIn,
+                     ReceiptIn, ReconcilePickupIn, RegisterAgentIn,
                      ResolveConflictIn, RetrieveIn, WasteIn)
 from .service import DomainError
 
@@ -51,7 +52,9 @@ def db(request: Request):
 def create_job(body: CreateJobIn, request: Request):
     return service.create_job(
         db(request), body.job_id, body.title,
-        body.page_count, body.copy_count, body.allowed_batches)
+        body.page_count, body.copy_count, body.allowed_batches,
+        credit_account_id=body.credit_account_id,
+        price_per_copy=body.price_per_copy)
 
 
 @app.get("/jobs/{job_id}")
@@ -191,6 +194,33 @@ def readiness(job_id: str, request: Request):
 @app.post("/jobs/{job_id}/copies/{copy_no}/deliver")
 def deliver(job_id: str, copy_no: int, request: Request):
     return service.confirm_delivery(db(request), job_id, copy_no)
+
+
+# ---- 企业授信取件 ---------------------------------------------------------
+
+@app.post("/jobs/{job_id}/credit-pickups", status_code=202)
+def credit_pickup(job_id: str, body: CreditPickupIn, request: Request):
+    """柜员提交授信取件（份号 + 取件请求号）。同号重送幂等收敛。"""
+    return service.request_credit_pickup(
+        db(request), job_id, body.copy_no, body.request_id)
+
+
+@app.get("/credit-pickups/{request_id}")
+def credit_pickup_status(request_id: str, request: Request):
+    """柜员查询取件结果（含冻结的交付清单与资金状态）。"""
+    return service.get_pickup(db(request), request_id)
+
+
+@app.get("/credit-pickups")
+def credit_pickups(job_id: Optional[str] = None, request: Request = None):
+    return {"pickups": service.list_pickups(db(request), job_id)}
+
+
+@app.post("/credit-pickups/{request_id}/reconcile")
+def credit_pickup_reconcile(request_id: str, body: ReconcilePickupIn,
+                            request: Request):
+    """对结果未定的取件请求主动对账收敛（与同号重送等价）。"""
+    return service.reconcile_pickup(db(request), request_id)
 
 
 @app.get("/jobs/{job_id}/delivery-list")

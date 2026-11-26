@@ -42,24 +42,76 @@
 | 指定批次工单的成品只能凭**已有领用记录的派工**认定 | `receive_receipt` / `onsite_retrieve` 守卫 |
 | 各批尚未发出张数、各份承诺状态与锁定批次、从派工追溯领用批次均可查 | `GET /paper/batches`、`/jobs/{id}/commitments`、`/dispatches/{id}/withdrawal` |
 
+## 企业授信取件
+
+独立的**模拟财务服务**（`finance/`，可独立启动，独立 SQLite，与印制服务
+不共用数据库、不接真实支付渠道）管理各企业的初始共享额度（整数分）。
+同一企业的不同工单共用同一账户额度。新工单可同时指定
+`credit_account_id` 与 `price_per_copy`；两者都省略则仍走原交付流程。
+
+### 资金与请求状态机
+
+* 财务侧每笔取件按**取件请求号**（request_id）幂等：`held`（待清算，
+  额度已锁定，其他取件不能再动用）→ `settled`（确已扣费）或
+  `voided`（已释放，未产生净费用）。资金台账只追加 hold/settle/release，
+  成功交付的一份最终只有 `hold+settle`，即**原价一次净扣费**。
+* 印制侧取件请求状态：`pending`（财务结果未定，明确显示待处理）→
+  `held` → `delivered`（终态，确已扣费）/ `rejected`（额度不足等，
+  无净费用）/ `released`（确认前条件失效，锁定释放、无净费用）。
+
+### 关键规则
+
+| 规则 | 实现位置 |
+| --- | --- |
+| 确认交付那一刻，成品仍须满足原有交付条件（整份每页 verified），且费用已有确定资金保障（hold 成功后才固化交付） | `service._pickup_held_stage` + `_check_deliverable` |
+| 额度不足不得交付，且不产生任何资金台账；原交付入口对授信工单强制拒绝，不能绕过授信 | `finance.service.hold`、`service.confirm_delivery` |
+| 同一企业不同工单共用额度；锁定额他人不可动用 | `finance.service._totals` |
+| 原请求号重送不多扣费（财务 hold/settle 均幂等）；请求号已用于其他取件则拒绝；同一份换号不能第二次交付/扣费 | `finance.service.hold`、`service.request_credit_pickup` |
+| 结果未定时显示"待处理"，绝不凭超时报告成功或认定没扣款 | `finance_client.FinanceUnavailable` + pending/held 状态 |
+| 财务无响应不阻塞原有回执、核对和非授信交付 | 财务调用仅限授信取件路径，原流程不依赖财务服务 |
+| 恢复后无需人工改账：重送/对账自动收敛，成功交付只留一次净扣费 | `service.reconcile_pickup` / `_drive_pickup` |
+| 确认前原交付条件失效：交付不成立，已锁额度必须恢复可用；原尝试终结后可用新请求号重新取件 | `service._pickup_release` |
+| 交付清单照旧冻结；交付后纸张矛盾只按原规则追查，不自动退钱（已 settle 不可 release） | 原 `investigations` 流程 + `finance.service.release` 守卫 |
+
+### 两端断连/重启的一致性
+
+印制服务与财务服务是两个进程、两个库，跨服务调用全部携带幂等键，
+任何一步"已生效但应答丢失"都靠重送收敛：
+
+* **hold 应答丢失**：印制侧 `pending`，财务侧可能已 `held`；重送同号，
+  财务按 request_id 幂等返回 held，随后继续交付与清算，不会重复锁钱。
+* **settle 应答丢失**：交付清单已固化、钱仍在 hold；重送补做幂等清算。
+* **release 应答丢失**：请求保持 `held` 且标记 `release_pending`，
+  重送完成释放。待处理状态在服务重启后仍持久有效。
+
 ## 目录结构
 
 ```
 print_center/
-├── server/            # FastAPI + SQLite 服务端
-│   ├── schema.py      # 表结构（含全部状态 CHECK 约束与纸料账表）
+├── server/            # 印制服务 FastAPI + SQLite
+│   ├── schema.py      # 表结构（含全部状态 CHECK 约束、纸料账表、授信取件表）
 │   ├── db.py          # 连接、串行写事务、审计日志
-│   ├── service.py     # 领域状态机（全部业务规则，含纸料承诺）
+│   ├── service.py     # 领域状态机（全部业务规则，含纸料承诺与授信取件）
+│   ├── finance_client.py # 调用模拟财务服务的 HTTP 客户端（故障=待处理，不臆断）
 │   ├── models.py      # 请求模型
 │   └── app.py         # HTTP 路由
+├── finance/           # 模拟财务服务（独立进程、独立 SQLite，可独立启动）
+│   ├── schema.py      # 企业账户、取件资金请求、只追加资金台账
+│   ├── db.py          # 独立连接与串行写事务
+│   ├── service.py     # hold/settle/release 幂等状态机与额度查询
+│   ├── app.py         # 财务 HTTP 路由（默认端口 8078）
+│   └── run_server.py  # 财务服务独立启动入口
 ├── agent/             # 独立本地打印代理（独立 SQLite，服务端不可读）
 │   ├── local_store.py # 代理本地介质
 │   └── print_agent.py # CLI：领活/出纸/回执/对账/停用，含崩溃注入
 ├── demo/
-│   ├── run_server.py  # uvicorn 启动入口
-│   └── demo.py        # 可复跑端到端演示（真实子进程，含服务重启）
+│   ├── run_server.py  # 印制服务 uvicorn 启动入口
+│   ├── demo.py        # 可复跑端到端演示（真实子进程，含服务重启）
+│   ├── credit_demo.py # 授信取件端到端演示（印制+财务+故障代理三进程）
+│   └── fault_proxy.py # 演示用故障注入代理（复现"已生效但应答丢失"）
 └── tests/
-    └── test_service.py# 状态机回归测试（unittest，31 例）
+    ├── test_service.py# 原有状态机回归测试（unittest，31 例）
+    └── test_credit.py # 财务服务与授信取件回归测试（unittest，25 例）
 ```
 
 ## 运行
@@ -86,6 +138,30 @@ PYTHONPATH=. python -m print_center.demo.demo
 * **F**：首张没印出来也锁定批次 → 补打只吃余量、**缺纸不挡已接工单
   原印** → **服务重启后承诺与领用仍有效** → 同批补纸后续打 → 交付，
   全程展示发出的纸不再回库。
+
+### 企业授信取件演示（独立财务服务）
+
+```bash
+PYTHONPATH=. python -m print_center.demo.credit_demo
+```
+
+每次运行清空 `/tmp/print_center_credit_demo/` 重建，真实拉起三个进程
+（印制服务、模拟财务服务、故障注入代理），两个业务数据库物理隔离。
+八个场景 G1–G8 覆盖：正常一次净扣费、额度不足拒绝、请求号与原入口
+守卫、财务宕机待处理且不阻塞非授信交付、**财务已处理(hold 落账)但
+应答丢失后重送一致收敛（核心场景 G5）**、确认前条件失效释放后用新
+请求号重取、共享额度与交付后不自动退款、双服务重启后持久化收敛。
+
+也可分别独立启动两个服务（各用各的库）：
+
+```bash
+# 财务服务（独立库，默认 8078）
+FINANCE_DB=/tmp/pc/finance.db FINANCE_PORT=8078 PYTHONPATH=. \
+  python -m print_center.finance.run_server
+# 印制服务（独立库，默认 8077），通过 FINANCE_URL 访问财务服务
+FINANCE_URL=http://127.0.0.1:8078 PRINTCENTER_DB=/tmp/pc/print.db \
+  PRINTCENTER_PORT=8077 PYTHONPATH=. python -m print_center.demo.run_server
+```
 
 ### 手动分步
 
@@ -129,7 +205,7 @@ curl -s localhost:8077/jobs/J2/commitments | jq    # 各份承诺状态与锁定
 ### HTTP 接口摘要
 
 ```
-POST   /jobs                                              建工单（可带 allowed_batches 指定批次）
+POST   /jobs                                              建工单（可带 allowed_batches；或 credit_account_id+price_per_copy 走授信）
 POST   /agents/{id}/claim                                 领活（FIFO；缺料补打自动跳过）
 POST   /receipts                                          回执（幂等，处理延迟/乱序）
 POST   /deactivations                                     停用确认
@@ -140,8 +216,12 @@ POST   /jobs/{j}/copies/{c}/pages/{p}/waste               记录废页
 POST   /jobs/{j}/copies/{c}/pages/{p}/resolve-conflict    矛盾选页（keep_paper_id 可空）
 POST   /jobs/{j}/copies/{c}/pages/{p}/reprint             补打
 GET    /jobs/{j}/delivery-readiness                       交付前阻塞检查
-POST   /jobs/{j}/copies/{c}/deliver                       确认交付（整页 verified 前置）
+POST   /jobs/{j}/copies/{c}/deliver                       确认交付（非授信工单；授信工单在此被拒）
 GET    /jobs/{j}/delivery-list                            交付清单（份号/页号/纸张号）
+POST   /jobs/{j}/credit-pickups                           授信取件（body: copy_no + request_id，幂等）
+GET    /credit-pickups/{request_id}                       取件结果 + 资金状态 + 交付清单
+GET    /credit-pickups?job_id=...                         取件请求列表
+POST   /credit-pickups/{request_id}/reconcile             待处理请求主动对账收敛（同号重送等价）
 POST   /paper/batches/{b}/arrivals                        登记批次到货（同批可再入库）
 GET    /paper/batches | /paper/batches/{b}                各批尚未发出张数与承诺占用
 GET    /jobs/{j}/commitments                              各份承诺状态及已锁定批次
@@ -151,10 +231,26 @@ GET    /dispatches/{d}/withdrawal                         从派工追溯领用�
 GET    /papers | /dispatches | /investigations | /events  视图与证据链
 ```
 
+模拟财务服务（默认 8078，独立库）：
+
+```
+POST   /accounts                                          登记企业账户与初始额度（整数分）
+GET    /accounts | /accounts/{id}                         当前可用额度（限额−锁定−已扣费）
+POST   /holds                                             按 request_id 锁定额度（幂等）
+POST   /requests/{id}/settle                              确认扣费（held→settled，幂等）
+POST   /requests/{id}/release                             释放锁定（held→voided，幂等）
+GET    /requests/{id} | /requests                         按取件请求追溯资金状态与台账
+GET    /ledger | /events                                  只追加资金台账与事件
+```
+
 ## 测试
 
 ```bash
-PYTHONPATH=. python -m unittest print_center.tests.test_service -v
+# 原有状态机回归（31 例）+ 财务与授信取件回归（25 例）
+PYTHONPATH=. python -m unittest print_center.tests.test_service \
+  print_center.tests.test_credit -v
+# 端到端演示（真实三进程，40 项断言）
+PYTHONPATH=. python -m print_center.demo.credit_demo
 ```
 
 ## 设计说明
@@ -177,3 +273,13 @@ PYTHONPATH=. python -m unittest print_center.tests.test_service -v
   一定找到，单印制中心规模下为毫秒级。
 * 模式变更说明：`job_copies.status` 与 `dispatches.status` 的 CHECK 新增
   `cancelled` 取值；旧的数据库文件请删除后重建（演示每次自动重建）。
+* 授信取件的跨服务一致性：两个服务各自用 `BEGIN IMMEDIATE` + 进程内锁
+  串行化本地写事务，互不共享数据库，只通过携带 request_id 的幂等 HTTP
+  交互。资金侧先 hold 再 settle，确保确认交付时费用已有确定保障、无需
+  企业补钱；印制侧把"交付清单固化"放在本地事务内，把资金清算做成可
+  安全重放的独立步骤。任一步应答丢失都不会被臆断为成功或未扣——请求
+  停在 `pending`/`held` 并明确展示，重送同号或对账时按财务真实状态
+  收敛，因此成功交付最终只有一次原价净扣费，条件失效则释放为零净费用。
+* 模式变更说明（授信）：`jobs` 新增 `credit_account_id`、
+  `price_per_copy` 两列，并新增 `delivery_requests` 表；财务库为全新
+  独立文件。旧的印制数据库文件请删除后重建（演示每次自动重建）。

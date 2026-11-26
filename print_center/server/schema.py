@@ -43,7 +43,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     copy_count    INTEGER NOT NULL CHECK (copy_count > 0),
     created_at    TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'open'
-                  CHECK (status IN ('open','delivered','investigating','closed'))
+                  CHECK (status IN ('open','delivered','investigating','closed')),
+    -- 企业授信取件：两列同时为空 = 不使用授信，走原交付流程；
+    -- 同时非空 = 每份成品从该企业共享额度按 price_per_copy（整数分）结算。
+    credit_account_id TEXT,
+    price_per_copy    INTEGER CHECK (price_per_copy IS NULL
+                                     OR price_per_copy >= 0)
 );
 
 -- 工单的份（份号从 1 开始，保留到交付清单）
@@ -221,6 +226,37 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     agent_id      TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+
+-- 企业授信取件请求（柜员提交：工单号 + 份号 + 取件请求号）。
+-- request_id 全局唯一幂等键；同一份同一时刻至多一个未终结请求，
+-- 旧请求终结（rejected/released/delivered）后才允许换新号重新发起，
+-- 因此"同一份换号"不能形成第二次交付或第二次扣费。
+CREATE TABLE IF NOT EXISTS delivery_requests (
+    request_id      TEXT PRIMARY KEY,
+    job_id          TEXT NOT NULL REFERENCES jobs(job_id),
+    copy_no         INTEGER NOT NULL,
+    account_id      TEXT NOT NULL,
+    amount          INTEGER NOT NULL CHECK (amount >= 0),
+    -- pending   已登记，资金结果未定（财务无响应/处理中断）；
+    -- held      财务已锁定额度，待清算（其他取件不能再动用这笔钱）；
+    -- delivered 交付成立且财务已确认扣费（终态）；
+    -- rejected  额度不足或请求冲突，未交付（终态，未产生净费用）；
+    -- released  原交付条件失效，锁定已释放、未交付（终态，未产生净费用）
+    status          TEXT NOT NULL
+                    CHECK (status IN ('pending','held','delivered',
+                                      'rejected','released')),
+    -- 已判定该请求不应交付、但财务释放尚未确认时置位（仍显示待处理）
+    release_pending INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    delivered_at    TEXT
+);
+
+-- 同一份至多一个"未终结"的取件请求（终态后允许换新号重新发起）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_requests_active_copy
+    ON delivery_requests(job_id, copy_no)
+    WHERE status IN ('pending','held');
 
 -- 全量事件日志（证据链）
 CREATE TABLE IF NOT EXISTS event_log (

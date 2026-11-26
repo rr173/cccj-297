@@ -13,6 +13,21 @@ class CreateJobIn(BaseModel):
     copy_count: int = Field(..., gt=0)
     # 指定允许使用的批次编号；缺省/null = 旧流程，不参与纸料账
     allowed_batches: Optional[list[str]] = None
+    # 企业授信取件：两字段必须同时给出（或同时省略）。
+    # 给出后该工单每份成品按 price_per_copy（整数分）从企业共享额度结算
+    credit_account_id: Optional[str] = Field(default=None, min_length=1)
+    price_per_copy: Optional[int] = Field(default=None, ge=0)
+
+
+class CreditPickupIn(BaseModel):
+    """柜员提交的授信取件请求：工单号在路径上，份号与取件请求号在体里。"""
+    copy_no: int = Field(..., gt=0)
+    request_id: str = Field(..., min_length=1)
+
+
+class ReconcilePickupIn(BaseModel):
+    """对结果未定的取件请求发起对账/收敛（可选人工触发，重送也会自动收敛）。"""
+    note: Optional[str] = None
 
 
 class ArrivalIn(BaseModel):

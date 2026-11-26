@@ -37,6 +37,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from .db import WriteTx, log_event, row_to_dict, utcnow
+from . import finance_client
 
 
 class DomainError(Exception):
@@ -367,10 +368,20 @@ def _shortage_message(c, allowed: list[str], page_count: int,
 # ---------------------------------------------------------------------------
 
 def create_job(conn, job_id: str, title: str, page_count: int,
-               copy_count: int, allowed_batches: list[str] | None = None
-               ) -> dict:
+               copy_count: int, allowed_batches: list[str] | None = None,
+               credit_account_id: str | None = None,
+               price_per_copy: int | None = None) -> dict:
     if page_count <= 0 or copy_count <= 0:
         raise DomainError("invalid_job", "页数与份数必须为正整数", 400)
+    # 授信参数必须成对出现；只给一个视为非法请求，不静默改走旧流程
+    if (credit_account_id is None) != (price_per_copy is None):
+        raise DomainError(
+            "invalid_credit_job",
+            "企业授信须同时给出 credit_account_id 与 price_per_copy"
+            "（整数分）；两者都省略则走不使用授信的原流程", 400)
+    if price_per_copy is not None and price_per_copy < 0:
+        raise DomainError("invalid_credit_job",
+                          "每份价格必须是非负整数分", 400)
     tracked = allowed_batches is not None
     if tracked:
         allowed_batches = sorted({b.strip() for b in allowed_batches
@@ -419,8 +430,10 @@ def create_job(conn, job_id: str, title: str, page_count: int,
         if rejection is None:
             c.execute(
                 "INSERT INTO jobs(job_id,title,page_count,copy_count,"
-                "created_at) VALUES (?,?,?,?,?)",
-                (job_id, title, page_count, copy_count, now),
+                "created_at,credit_account_id,price_per_copy) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (job_id, title, page_count, copy_count, now,
+                 credit_account_id, price_per_copy),
             )
             for copy_no in range(1, copy_count + 1):
                 c.execute(
@@ -456,7 +469,8 @@ def create_job(conn, job_id: str, title: str, page_count: int,
                 "job_id": job_id, "title": title,
                 "page_count": page_count, "copy_count": copy_count,
                 "allowed_batches": allowed_batches if tracked else None,
-            })
+                "credit_account_id": credit_account_id,
+                "price_per_copy": price_per_copy})
     if rejection is not None:
         raise DomainError("insufficient_stock", rejection, 409)
     return get_job(conn, job_id)
@@ -1205,56 +1219,421 @@ def delivery_readiness(conn, job_id: str) -> list[dict]:
     return result
 
 
+def _check_deliverable(c, job: dict, copy_no: int) -> tuple[dict, list[dict]]:
+    """原有交付条件（不变）：份存在、未撤销/未交付，整份每页 verified
+    且都有唯一保留纸。返回（份行，槽位列表）。"""
+    cp = row_to_dict(_get(
+        c, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
+        (job["job_id"], copy_no)))
+    if cp is None:
+        raise DomainError("copy_not_found", "份不存在", 404)
+    if cp["status"] == "cancelled":
+        raise DomainError("copy_cancelled", "该份已撤销，不再派工或交付")
+    if cp["status"] == "delivered":
+        raise DomainError("already_delivered", "该份已交付")
+    slots = _all(
+        c, "SELECT * FROM page_slots WHERE job_id=? AND copy_no=? "
+          "ORDER BY page_no", (job["job_id"], copy_no))
+    if len(slots) != job["page_count"]:
+        raise DomainError("slot_count_mismatch", "槽位不完整")
+    bad = [s for s in slots if s["status"] != "verified"
+           or not s["retained_paper_id"]]
+    if bad:
+        raise DomainError(
+            "not_deliverable",
+            "只有整份每页都明确且有效（verified）才可交付；"
+            f"未满足页：{[s['page_no'] for s in bad]}")
+    return cp, slots
+
+
+def _record_delivery(c, job_id: str, copy_no: int, slots: list[dict],
+                     request_id: str | None = None) -> dict:
+    """在当前事务内固化交付清单（只追加）并推进份/工单状态。"""
+    now = utcnow()
+    items = []
+    for s in slots:
+        paper = _paper(c, s["retained_paper_id"])
+        c.execute(
+            "INSERT INTO delivery_items(job_id,copy_no,page_no,"
+            "paper_id,dispatch_id,delivered_at) VALUES (?,?,?,?,?,?)",
+            (job_id, copy_no, s["page_no"], s["retained_paper_id"],
+             paper["dispatch_id"], now))
+        items.append({"copy_no": copy_no, "page_no": s["page_no"],
+                      "paper_id": s["retained_paper_id"],
+                      "dispatch_id": paper["dispatch_id"]})
+    c.execute(
+        "UPDATE job_copies SET status='delivered', paused_reason=NULL "
+        "WHERE job_id=? AND copy_no=?", (job_id, copy_no))
+    if not _get(c, "SELECT 1 FROM job_copies WHERE job_id=? AND "
+                   "status NOT IN ('delivered','cancelled')", (job_id,)):
+        c.execute("UPDATE jobs SET status='delivered' WHERE job_id=?",
+                  (job_id,))
+    log_event(c, "delivery_confirmed", {
+        "job_id": job_id, "copy_no": copy_no, "items": items,
+        "request_id": request_id})
+    return {"job_id": job_id, "copy_no": copy_no,
+            "delivered_at": now, "items": items,
+            "request_id": request_id}
+
+
 def confirm_delivery(conn, job_id: str, copy_no: int) -> dict:
+    """原交付入口：不使用授信的工单仍走此流程。
+
+    授信工单在此被明确拒绝——不能绕过授信资金保障直接交付。
+    """
     with WriteTx(conn) as c:
         job = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
                                (job_id,)))
         if job is None:
             raise DomainError("job_not_found", f"工单 {job_id} 不存在", 404)
+        if job["credit_account_id"] is not None:
+            raise DomainError(
+                "credit_delivery_required",
+                f"工单 {job_id} 使用企业授信（账户 "
+                f"{job['credit_account_id']}），必须携带取件请求号走授信"
+                "取件入口；原交付入口不能绕过授信", 409)
+        _, slots = _check_deliverable(c, job, copy_no)
+        return _record_delivery(c, job_id, copy_no, slots)
+
+
+# ---------------------------------------------------------------------------
+# 企业授信取件：请求号幂等 + 跨服务资金状态机
+# ---------------------------------------------------------------------------
+
+def _credit_job(c, job_id: str) -> dict:
+    job = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                           (job_id,)))
+    if job is None:
+        raise DomainError("job_not_found", f"工单 {job_id} 不存在", 404)
+    if job["credit_account_id"] is None:
+        raise DomainError(
+            "not_credit_job",
+            f"工单 {job_id} 未使用企业授信，请走原交付入口", 409)
+    return job
+
+
+def _pickup_row(c, request_id: str):
+    return row_to_dict(_get(
+        c, "SELECT * FROM delivery_requests WHERE request_id=?",
+        (request_id,)))
+
+
+def _pickup_view(conn, row: dict) -> dict:
+    """取件结果视图：明确区分待处理/待清算、确已扣费、未产生净费用，
+    并在已交付时附上冻结的交付清单。"""
+    status = row["status"]
+    if status == "delivered":
+        fund_status, fund_text = "charged", "确已扣费"
+    elif status in ("rejected", "released"):
+        fund_status, fund_text = "no_net_charge", "未产生净费用"
+    elif status == "held":
+        fund_status, fund_text = "held", "待清算：额度已锁定，交付/清算处理中"
+    else:
+        fund_status, fund_text = "pending", "待处理：财务结果未定，请勿重复下单"
+    out = dict(row)
+    out["fund_status"] = fund_status
+    out["fund_status_text"] = fund_text
+    out["delivery_list"] = (
+        delivery_list(conn, row["job_id"], row["copy_no"])["items"]
+        if status == "delivered" else [])
+    return out
+
+
+def request_credit_pickup(conn, job_id: str, copy_no: int,
+                          request_id: str) -> dict:
+    """柜员提交授信取件：工单号 + 份号 + 取件请求号。
+
+    幂等/冲突
+    ---------
+    * 同 request_id 重送：返回同一请求的收敛结果，不多扣费、不重复交付；
+    * request_id 已用于其他（工单/份）取件：拒绝；
+    * 同一份尚有未终结请求时换新号：拒绝（换号不能形成第二次交付）。
+    终态（rejected/released）后允许用新请求号重新发起。
+    """
+    with WriteTx(conn) as c:
+        job = _credit_job(c, job_id)
+        existing = _pickup_row(c, request_id)
+        if existing is not None:
+            if (existing["job_id"], existing["copy_no"]) != \
+                    (job_id, copy_no):
+                raise DomainError(
+                    "request_id_conflict",
+                    f"取件请求号 {request_id} 已用于工单 "
+                    f"{existing['job_id']} 份 {existing['copy_no']} 的取件，"
+                    "不能复用于其他取件", 409)
+            snapshot = dict(existing)
+        else:
+            cp = row_to_dict(_get(
+                c, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
+                (job_id, copy_no)))
+            if cp is None:
+                raise DomainError("copy_not_found", "份不存在", 404)
+            if cp["status"] == "cancelled":
+                raise DomainError("copy_cancelled",
+                                  "该份已撤销，不再派工或交付")
+            if cp["status"] == "delivered":
+                # 同一份换号也不能形成第二次交付或扣费
+                prior = _get(
+                    c, "SELECT request_id FROM delivery_requests "
+                       "WHERE job_id=? AND copy_no=? AND status='delivered' "
+                       "LIMIT 1", (job_id, copy_no))
+                raise DomainError(
+                    "already_delivered",
+                    f"工单 {job_id} 份 {copy_no} 已凭取件请求 "
+                    f"{prior['request_id'] if prior else ''} 交付；"
+                    "同一份换号不能形成第二次交付或扣费")
+            active = _get(
+                c, "SELECT request_id FROM delivery_requests "
+                   "WHERE job_id=? AND copy_no=? AND status IN "
+                   "('pending','held') LIMIT 1", (job_id, copy_no))
+            if active is not None:
+                raise DomainError(
+                    "pickup_already_in_progress",
+                    f"工单 {job_id} 份 {copy_no} 已有未终结取件请求 "
+                    f"{active['request_id']}：请用原请求号重送或等待其"
+                    "终结；同一份换号不能形成第二次交付或扣费", 409)
+            now = utcnow()
+            c.execute(
+                "INSERT INTO delivery_requests(request_id,job_id,copy_no,"
+                "account_id,amount,status,release_pending,created_at,"
+                "updated_at) VALUES (?,?,?,?,?, 'pending', 0, ?,?)",
+                (request_id, job_id, copy_no, job["credit_account_id"],
+                 job["price_per_copy"], now, now))
+            log_event(c, "pickup_requested", {
+                "request_id": request_id, "job_id": job_id,
+                "copy_no": copy_no,
+                "account_id": job["credit_account_id"],
+                "amount": job["price_per_copy"]})
+            snapshot = dict(_pickup_row(c, request_id))
+
+    if snapshot["status"] in ("delivered", "rejected", "released"):
+        return _pickup_view(conn, snapshot)   # 终态重送：幂等回放
+    return _drive_pickup(conn, snapshot)
+
+
+def _drive_pickup(conn, row: dict) -> dict:
+    """按请求当前状态推进一步收敛；所有外部调用都带幂等键，可安全重入。"""
+    if row["status"] == "pending":
+        return _pickup_hold_stage(conn, row["request_id"])
+    if row["status"] == "held":
+        return _pickup_held_stage(conn, row["request_id"])
+    return _pickup_view(conn, row)
+
+
+def _pickup_hold_stage(conn, request_id: str) -> dict:
+    """pending：向财务锁定额度。"""
+    with WriteTx(conn) as c:
+        snapshot = dict(_pickup_row(c, request_id))
+    if snapshot["status"] != "pending":
+        return _drive_pickup(conn, snapshot)
+    try:
+        fin = finance_client.hold(
+            request_id, snapshot["account_id"], snapshot["amount"],
+            reference=f"{snapshot['job_id']}#copy{snapshot['copy_no']}")
+    except finance_client.FinanceRejected as exc:
+        # 额度不足/请求号冲突等明确拒绝：不交付、无净费用，请求终结
+        with WriteTx(conn) as c:
+            c.execute(
+                "UPDATE delivery_requests SET status='rejected', "
+                "last_error=?, updated_at=? WHERE request_id=? "
+                "AND status='pending'",
+                (f"{exc.code}: {exc.message}", utcnow(), request_id))
+            log_event(c, "pickup_rejected", {
+                "request_id": request_id, "error_code": exc.code,
+                "message": exc.message})
+        return _pickup_view(conn, _pickup_row(conn, request_id))
+    except finance_client.FinanceUnavailable as exc:
+        # 结果未知：保持待处理，绝不凭超时报告成功或认定没扣款
+        with WriteTx(conn) as c:
+            c.execute(
+                "UPDATE delivery_requests SET last_error=?, updated_at=? "
+                "WHERE request_id=? AND status='pending'",
+                (f"finance_unavailable: {exc}", utcnow(), request_id))
+            log_event(c, "pickup_finance_unavailable",
+                      {"request_id": request_id, "stage": "hold"})
+        return _pickup_view(conn, _pickup_row(conn, request_id))
+
+    if fin.get("status") == "voided":
+        # 防御分支：同号资金已被释放（本服务正常流程下不会出现）
+        with WriteTx(conn) as c:
+            c.execute(
+                "UPDATE delivery_requests SET status='rejected', "
+                "last_error=?, updated_at=? WHERE request_id=? "
+                "AND status='pending'",
+                ("finance_request_voided: 同号资金已释放，交付不成立",
+                 utcnow(), request_id))
+            log_event(c, "pickup_rejected", {
+                "request_id": request_id,
+                "error_code": "finance_request_voided"})
+        return _pickup_view(conn, _pickup_row(conn, request_id))
+
+    with WriteTx(conn) as c:
+        c.execute(
+            "UPDATE delivery_requests SET status='held', last_error=NULL, "
+            "updated_at=? WHERE request_id=? AND status='pending'",
+            (utcnow(), request_id))
+        log_event(c, "pickup_funds_held", {
+            "request_id": request_id,
+            "finance_status": fin.get("status")})
+    return _pickup_held_stage(conn, request_id)
+
+
+def _pickup_held_stage(conn, request_id: str) -> dict:
+    """held：额度已有确定保障。确认交付条件仍满足 -> 固化交付并清算；
+    条件失效或被标记放弃 -> 释放锁定，交付不成立。"""
+    with WriteTx(conn) as c:
+        row = dict(_pickup_row(c, request_id))
+        job = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                               (row["job_id"],)))
         cp = row_to_dict(_get(
             c, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
-            (job_id, copy_no)))
-        if cp is None:
-            raise DomainError("copy_not_found", "份不存在", 404)
-        if cp["status"] == "cancelled":
-            raise DomainError("copy_cancelled", "该份已撤销，不再派工或交付")
-        if cp["status"] == "delivered":
-            raise DomainError("already_delivered", "该份已交付")
-        slots = _all(
-            c, "SELECT * FROM page_slots WHERE job_id=? AND copy_no=? "
-              "ORDER BY page_no", (job_id, copy_no))
-        if len(slots) != job["page_count"]:
-            raise DomainError("slot_count_mismatch", "槽位不完整")
-        bad = [s for s in slots if s["status"] != "verified"
-               or not s["retained_paper_id"]]
-        if bad:
-            raise DomainError(
-                "not_deliverable",
-                "只有整份每页都明确且有效（verified）才可交付；"
-                f"未满足页：{[s['page_no'] for s in bad]}")
-        now = utcnow()
-        items = []
-        for s in slots:
-            paper = _paper(c, s["retained_paper_id"])
+            (row["job_id"], row["copy_no"])))
+
+    # 上一轮已固化交付但清算应答丢失：只需补做幂等清算
+    if cp is not None and cp["status"] == "delivered":
+        return _pickup_settle(conn, request_id)
+
+    if row["release_pending"]:
+        return _pickup_release(conn, request_id,
+                               row.get("last_error") or "交付条件失效")
+
+    with WriteTx(conn) as c:
+        job2 = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                                (row["job_id"],)))
+        try:
+            _, slots = _check_deliverable(c, job2, row["copy_no"])
+        except DomainError as exc:
+            # 原交付条件在确认前失效：本次交付不得成立，额度必须恢复可用
             c.execute(
-                "INSERT INTO delivery_items(job_id,copy_no,page_no,"
-                "paper_id,dispatch_id,delivered_at) VALUES (?,?,?,?,?,?)",
-                (job_id, copy_no, s["page_no"], s["retained_paper_id"],
-                 paper["dispatch_id"], now))
-            items.append({"copy_no": copy_no, "page_no": s["page_no"],
-                          "paper_id": s["retained_paper_id"],
-                          "dispatch_id": paper["dispatch_id"]})
+                "UPDATE delivery_requests SET release_pending=1, "
+                "last_error=?, updated_at=? WHERE request_id=? "
+                "AND status='held'",
+                (f"{exc.code}: {exc.message}", utcnow(), request_id))
+            log_event(c, "pickup_conditions_failed", {
+                "request_id": request_id, "error_code": exc.code,
+                "message": exc.message})
+            failure = exc
+        else:
+            failure = None
+    if failure is not None:
+        return _pickup_release(conn, request_id, str(failure))
+
+    # 条件满足：先在本地事务固化交付（清单照旧冻结），再做幂等清算。
+    # 此刻额度处于 held，资金保障确定；清算只需把同一笔 hold 转 settle。
+    with WriteTx(conn) as c:
+        job3 = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                                (row["job_id"],)))
+        _, slots = _check_deliverable(c, job3, row["copy_no"])
+        _record_delivery(c, row["job_id"], row["copy_no"], slots,
+                         request_id=request_id)
+        log_event(c, "pickup_delivery_recorded",
+                  {"request_id": request_id})
+    return _pickup_settle(conn, request_id)
+
+
+def _pickup_settle(conn, request_id: str) -> dict:
+    with WriteTx(conn) as c:
+        row = dict(_pickup_row(c, request_id))
+    try:
+        fin = finance_client.settle(request_id, row["amount"])
+    except finance_client.FinanceUnavailable as exc:
+        # 交付已成立但清算应答未知：钱仍在 hold 中（他人动不了），
+        # 保持待清算状态，重送/对账后自动完成，无需人工改账
+        with WriteTx(conn) as c:
+            c.execute(
+                "UPDATE delivery_requests SET last_error=?, updated_at=? "
+                "WHERE request_id=? AND status='held'",
+                (f"finance_unavailable: {exc}", utcnow(), request_id))
+            log_event(c, "pickup_finance_unavailable",
+                      {"request_id": request_id, "stage": "settle"})
+        return _pickup_view(conn, _pickup_row(conn, request_id))
+    except finance_client.FinanceRejected as exc:
+        # 防御：先查财务真实状态再决定，绝不臆断
+        try:
+            fin = finance_client.get_request(request_id)
+        except finance_client.FinanceUnavailable:
+            with WriteTx(conn) as c:
+                c.execute(
+                    "UPDATE delivery_requests SET last_error=?, updated_at=? "
+                    "WHERE request_id=? AND status='held'",
+                    (f"settle_rejected_then_unreachable: {exc}",
+                     utcnow(), request_id))
+            return _pickup_view(conn, _pickup_row(conn, request_id))
+        if fin.get("status") != "settled":
+            raise
+    with WriteTx(conn) as c:
+        now = utcnow()
         c.execute(
-            "UPDATE job_copies SET status='delivered', paused_reason=NULL "
-            "WHERE job_id=? AND copy_no=?", (job_id, copy_no))
-        if not _get(c, "SELECT 1 FROM job_copies WHERE job_id=? AND "
-                       "status NOT IN ('delivered','cancelled')", (job_id,)):
-            c.execute("UPDATE jobs SET status='delivered' WHERE job_id=?",
-                      (job_id,))
-        log_event(c, "delivery_confirmed", {
-            "job_id": job_id, "copy_no": copy_no, "items": items})
-        return {"job_id": job_id, "copy_no": copy_no,
-                "delivered_at": now, "items": items}
+            "UPDATE delivery_requests SET status='delivered', "
+            "release_pending=0, last_error=NULL, delivered_at=?, "
+            "updated_at=? WHERE request_id=? AND status='held'",
+            (now, now, request_id))
+        log_event(c, "pickup_settled_delivered", {
+            "request_id": request_id,
+            "finance_status": fin.get("status")})
+    return _pickup_view(conn, _pickup_row(conn, request_id))
+
+
+def _pickup_release(conn, request_id: str, reason: str) -> dict:
+    try:
+        fin = finance_client.release(request_id, reason)
+    except finance_client.FinanceUnavailable as exc:
+        # 释放尚未确认：维持 held + release_pending，仍按待处理展示，
+        # 不阻塞其他任何流程；恢复后重送/对账自动完成释放
+        with WriteTx(conn) as c:
+            c.execute(
+                "UPDATE delivery_requests SET release_pending=1, "
+                "last_error=?, updated_at=? WHERE request_id=? "
+                "AND status='held'",
+                (f"release_pending_finance_unavailable: {exc}",
+                 utcnow(), request_id))
+            log_event(c, "pickup_finance_unavailable",
+                      {"request_id": request_id, "stage": "release"})
+        return _pickup_view(conn, _pickup_row(conn, request_id))
+    with WriteTx(conn) as c:
+        c.execute(
+            "UPDATE delivery_requests SET status='released', "
+            "release_pending=0, updated_at=? "
+            "WHERE request_id=? AND status='held'",
+            (utcnow(), request_id))
+        log_event(c, "pickup_released", {
+            "request_id": request_id, "reason": reason,
+            "finance_status": fin.get("status")})
+    return _pickup_view(conn, _pickup_row(conn, request_id))
+
+
+def reconcile_pickup(conn, request_id: str) -> dict:
+    """对结果未定的取件请求主动对账收敛（重送同一请求号等价）。"""
+    with WriteTx(conn) as c:
+        row = _pickup_row(c, request_id)
+        if row is None:
+            raise DomainError(
+                "pickup_not_found", f"取件请求 {request_id} 不存在", 404)
+        snapshot = dict(row)
+    if snapshot["status"] in ("delivered", "rejected", "released"):
+        return _pickup_view(conn, snapshot)
+    return _drive_pickup(conn, snapshot)
+
+
+def get_pickup(conn, request_id: str) -> dict:
+    with WriteTx(conn) as c:
+        row = _pickup_row(c, request_id)
+        if row is None:
+            raise DomainError(
+                "pickup_not_found", f"取件请求 {request_id} 不存在", 404)
+        snapshot = dict(row)
+    return _pickup_view(conn, snapshot)
+
+
+def list_pickups(conn, job_id: str | None = None) -> list[dict]:
+    with WriteTx(conn) as c:
+        if job_id is not None:
+            rows = _all(
+                c, "SELECT * FROM delivery_requests WHERE job_id=? "
+                   "ORDER BY rowid", (job_id,))
+        else:
+            rows = _all(c, "SELECT * FROM delivery_requests ORDER BY rowid")
+    return [_pickup_view(conn, r) for r in rows]
 
 
 def delivery_list(conn, job_id: str, copy_no: int | None = None) -> dict:
