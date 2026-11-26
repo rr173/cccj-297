@@ -40,8 +40,37 @@ def init_db(db_path: str | Path) -> None:
     try:
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对早期演示库做无损补列/证据回填。新库的 SCHEMA_SQL 已含最终结构。"""
+    jc_cols = _table_columns(conn, "job_copies")
+    if "copy_kind" not in jc_cols:
+        conn.execute(
+            "ALTER TABLE job_copies ADD COLUMN copy_kind TEXT NOT NULL "
+            "DEFAULT 'original'")
+    di_cols = _table_columns(conn, "delivery_items")
+    if "request_id" not in di_cols:
+        conn.execute("ALTER TABLE delivery_items ADD COLUMN request_id TEXT")
+    if "exchange_id" not in di_cols:
+        conn.execute("ALTER TABLE delivery_items ADD COLUMN exchange_id TEXT")
+
+    # 旧库没有 custody：已冻结交付清单的份视为原交付份仍在手。
+    conn.execute(
+        "INSERT OR IGNORE INTO copy_custody("
+        "physical_job_id, physical_copy_no, logical_job_id, "
+        "logical_copy_no, status, delivered_at) "
+        "SELECT job_id, copy_no, job_id, copy_no, 'with_customer', "
+        "MIN(delivered_at) FROM delivery_items "
+        "GROUP BY job_id, copy_no")
+    conn.commit()
 
 
 class WriteTx:

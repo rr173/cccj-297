@@ -32,6 +32,8 @@
 """
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -56,6 +58,21 @@ class DomainError(Exception):
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _coerce_copy_no(value) -> int:
+    """接受 3、"3"、"copy-3" 等常见份号表达。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return int(value)
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    match = re.search(r"(\d+)\s*$", text)
+    if match:
+        return int(match.group(1))
+    raise ValueError(f"invalid copy number: {value!r}")
 
 
 def _get(conn, sql: str, params=()):
@@ -180,10 +197,31 @@ def _is_tracked(c, job_id: str) -> bool:
                 (job_id,)) is not None
 
 
-def _allowed_batches(c, job_id: str) -> list[str]:
+def _allowed_batches(c, job_id: str, copy_no: int | None = None) -> list[str]:
+    """工单允许批次。
+
+    指定 copy_no 且该份有单独指定（备品创建时常用）时，以份级列表为准；
+    否则回退到工单级 ``job_batch_policies``。
+    """
+    if copy_no is not None:
+        rows = c.execute(
+            "SELECT batch_id FROM copy_allowed_batches WHERE job_id=? "
+            "AND copy_no=? ORDER BY batch_id", (job_id, copy_no)).fetchall()
+        if rows:
+            return [r["batch_id"] for r in rows]
     return [r["batch_id"] for r in c.execute(
         "SELECT batch_id FROM job_batch_policies WHERE job_id=? "
         "ORDER BY batch_id", (job_id,)).fetchall()]
+
+
+def _recalled_batch_ids(c) -> set[str]:
+    return {r["batch_id"] for r in c.execute(
+        "SELECT batch_id FROM paper_batch_recalls").fetchall()}
+
+
+def _filter_assignable_batches(c, batches: list[str]) -> list[str]:
+    recalled = _recalled_batch_ids(c)
+    return [b for b in batches if b not in recalled]
 
 
 def _arrived_by_batch(c) -> dict[str, int]:
@@ -238,7 +276,8 @@ def _planned_items(c) -> list[dict]:
            "FROM copy_commitments cc WHERE cc.status='planned' "
            "ORDER BY cc.job_id, cc.copy_no")
     return [{"key": (r["job_id"], r["copy_no"]), "demand": r["demand"],
-             "allowed": _allowed_batches(c, r["job_id"])} for r in rows]
+             "allowed": _allowed_batches(c, r["job_id"], r["copy_no"])}
+            for r in rows]
 
 
 def _fractional_deficit(caps: dict[str, int], items: list[dict]) -> int:
@@ -334,6 +373,69 @@ def _solve_assignment(available: dict[str, int], locked: dict[str, int],
         return False
 
     return assignment if backtrack(0) else None
+
+
+def _copy_paper_usage(c, job_id: str, copy_no: int) -> list[dict]:
+    """该物理份实际纸张 -> 派工 -> 领用批次的证据链。
+
+    已交付份以只追加的 delivery_items 为准；未交付份以当前 verified
+    retained_paper_id 为准。绝不使用工单允许批次或承诺/排产批次反推。
+    """
+    delivered = _get(
+        c, "SELECT 1 FROM delivery_items WHERE job_id=? AND copy_no=? LIMIT 1",
+        (job_id, copy_no))
+    if delivered is not None:
+        return _all(c, """
+            SELECT di.page_no AS page_no, di.paper_id AS paper_id,
+                   di.dispatch_id AS delivery_dispatch_id,
+                   p.dispatch_id AS paper_dispatch_id,
+                   COALESCE(wp.batch_id, wd.batch_id) AS batch_id,
+                   COALESCE(wp.withdrawal_id, wd.withdrawal_id)
+                       AS withdrawal_id
+            FROM delivery_items di
+            LEFT JOIN papers p ON p.paper_id = di.paper_id
+            LEFT JOIN withdrawals wp ON wp.dispatch_id = p.dispatch_id
+            LEFT JOIN withdrawals wd ON wd.dispatch_id = di.dispatch_id
+            WHERE di.job_id=? AND di.copy_no=?
+            ORDER BY di.page_no
+        """, (job_id, copy_no))
+    return _all(c, """
+        SELECT s.page_no AS page_no,
+               s.retained_paper_id AS paper_id,
+               p.dispatch_id AS paper_dispatch_id,
+               p.dispatch_id AS delivery_dispatch_id,
+               w.batch_id AS batch_id,
+               w.withdrawal_id AS withdrawal_id
+        FROM page_slots s
+        LEFT JOIN papers p ON p.paper_id = s.retained_paper_id
+        LEFT JOIN withdrawals w ON w.dispatch_id = p.dispatch_id
+        WHERE s.job_id=? AND s.copy_no=?
+        ORDER BY s.page_no
+    """, (job_id, copy_no))
+
+
+def _recalled_usage(c, job_id: str, copy_no: int) -> list[dict]:
+    """实际用纸中属于永久召回批次的记录。未追踪工单没有领用批次，返回空。"""
+    if not _is_tracked(c, job_id):
+        return []
+    recalled = _recalled_batch_ids(c)
+    if not recalled:
+        return []
+    return [u for u in _copy_paper_usage(c, job_id, copy_no)
+            if u.get("batch_id") in recalled]
+
+
+def _assert_copy_not_recalled(c, job_id: str, copy_no: int) -> list[dict]:
+    bad = _recalled_usage(c, job_id, copy_no)
+    if bad:
+        batches = sorted({u["batch_id"] for u in bad})
+        err = DomainError(
+            "batch_recalled",
+            f"工单 {job_id} 份 {copy_no} 的实际用纸来自已永久召回批次 "
+            f"{batches}，不能交给客户或作为合格备品交出", 409)
+        err.details = {"recalled_batches": batches, "papers": bad}
+        raise err
+    return bad
 
 
 def _shortage_message(c, allowed: list[str], page_count: int,
@@ -1201,7 +1303,8 @@ def delivery_readiness(conn, job_id: str) -> list[dict]:
     for cp in copies:
         if cp["status"] == "cancelled":
             result.append({
-                "copy_no": cp["copy_no"], "status": "cancelled",
+                "copy_no": cp["copy_no"], "copy_kind": cp.get("copy_kind"),
+                "status": "cancelled",
                 "paused_reason": cp["paused_reason"],
                 "ready": False, "blocking_slots": []})
             continue
@@ -1212,21 +1315,54 @@ def delivery_readiness(conn, job_id: str) -> list[dict]:
             {"page_no": s["page_no"], "status": s["status"],
              "note": s["conflict_note"]}
             for s in slots if s["status"] != "verified"]
+        recalled_usage = _recalled_usage(conn, job_id, cp["copy_no"])
+        recalled_batches = sorted(
+            {u["batch_id"] for u in recalled_usage if u.get("batch_id")})
+        if recalled_batches:
+            blocking.append({
+                "scope": "batch_recall", "status": "batch_recalled",
+                "batches": recalled_batches,
+                "note": "实际用纸含永久召回批次，不能交付"})
+        is_spare = cp.get("copy_kind") == "spare"
+        if is_spare:
+            blocking.append({
+                "scope": "delivery_channel",
+                "status": "spare_exchange_only",
+                "note": "备品只能经柜台换货交给原工单客户"})
+        slot_ready = all(s["status"] == "verified" for s in slots)
         result.append({
-            "copy_no": cp["copy_no"], "status": cp["status"],
+            "copy_no": cp["copy_no"], "copy_kind": cp.get("copy_kind"),
+            "status": cp["status"],
             "paused_reason": cp["paused_reason"],
-            "ready": not blocking, "blocking_slots": blocking})
+            "ready": not blocking,
+            "slot_ready": slot_ready,
+            "ordinary_delivery_allowed": not is_spare
+            and not recalled_batches,
+            "exchange_ready": is_spare and slot_ready
+            and not recalled_batches,
+            "recalled_batches": recalled_batches,
+            "blocking_slots": blocking})
     return result
 
 
-def _check_deliverable(c, job: dict, copy_no: int) -> tuple[dict, list[dict]]:
+def _check_deliverable(c, job: dict, copy_no: int, *,
+                       allow_spare: bool = False) -> tuple[dict, list[dict]]:
     """原有交付条件（不变）：份存在、未撤销/未交付，整份每页 verified
-    且都有唯一保留纸。返回（份行，槽位列表）。"""
+    且都有唯一保留纸。返回（份行，槽位列表）。
+
+    allow_spare=False 时备品份不能走普通/授信取件；换货校验显式传 True。
+    纸料追踪工单还必须满足：实际保留纸的领用批次均未被永久召回。
+    """
     cp = row_to_dict(_get(
         c, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
         (job["job_id"], copy_no)))
     if cp is None:
         raise DomainError("copy_not_found", "份不存在", 404)
+    if cp.get("copy_kind") == "spare" and not allow_spare:
+        raise DomainError(
+            "spare_exchange_only",
+            f"工单 {job['job_id']} 份 {copy_no} 是补制备品，只能经柜台"
+            "换货交给原工单客户，不能走普通或授信取件", 409)
     if cp["status"] == "cancelled":
         raise DomainError("copy_cancelled", "该份已撤销，不再派工或交付")
     if cp["status"] == "delivered":
@@ -1243,11 +1379,13 @@ def _check_deliverable(c, job: dict, copy_no: int) -> tuple[dict, list[dict]]:
             "not_deliverable",
             "只有整份每页都明确且有效（verified）才可交付；"
             f"未满足页：{[s['page_no'] for s in bad]}")
+    _assert_copy_not_recalled(c, job["job_id"], copy_no)
     return cp, slots
 
 
 def _record_delivery(c, job_id: str, copy_no: int, slots: list[dict],
-                     request_id: str | None = None) -> dict:
+                     request_id: str | None = None,
+                     exchange_id: str | None = None) -> dict:
     """在当前事务内固化交付清单（只追加）并推进份/工单状态。"""
     now = utcnow()
     items = []
@@ -1255,17 +1393,28 @@ def _record_delivery(c, job_id: str, copy_no: int, slots: list[dict],
         paper = _paper(c, s["retained_paper_id"])
         c.execute(
             "INSERT INTO delivery_items(job_id,copy_no,page_no,"
-            "paper_id,dispatch_id,delivered_at) VALUES (?,?,?,?,?,?)",
+            "paper_id,dispatch_id,delivered_at,request_id,exchange_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (job_id, copy_no, s["page_no"], s["retained_paper_id"],
-             paper["dispatch_id"], now))
+             paper["dispatch_id"], now, request_id, exchange_id))
         items.append({"copy_no": copy_no, "page_no": s["page_no"],
                       "paper_id": s["retained_paper_id"],
                       "dispatch_id": paper["dispatch_id"]})
     c.execute(
         "UPDATE job_copies SET status='delivered', paused_reason=NULL "
         "WHERE job_id=? AND copy_no=?", (job_id, copy_no))
+    # 每次真实交付都建立物理份持有关系。换货事务随后会把备品 custody 的
+    # logical_* 改指向原交付份，并把旧物理份置为 returned。
+    c.execute(
+        "INSERT INTO copy_custody(physical_job_id,physical_copy_no,"
+        "logical_job_id,logical_copy_no,status,source_request_id,"
+        "out_exchange_id,delivered_at) VALUES (?,?,?,?, 'with_customer',"
+        "?,?,?)",
+        (job_id, copy_no, job_id, copy_no, request_id, exchange_id, now))
     if not _get(c, "SELECT 1 FROM job_copies WHERE job_id=? AND "
-                   "status NOT IN ('delivered','cancelled')", (job_id,)):
+                   "status NOT IN ('delivered','cancelled') "
+                   "AND COALESCE(copy_kind,'original')='original'",
+                (job_id,)):
         c.execute("UPDATE jobs SET status='delivered' WHERE job_id=?",
                   (job_id,))
     log_event(c, "delivery_confirmed", {
@@ -1371,6 +1520,11 @@ def request_credit_pickup(conn, job_id: str, copy_no: int,
             if cp["status"] == "cancelled":
                 raise DomainError("copy_cancelled",
                                   "该份已撤销，不再派工或交付")
+            if cp.get("copy_kind") == "spare":
+                raise DomainError(
+                    "spare_exchange_only",
+                    f"工单 {job_id} 份 {copy_no} 是备品，只能经柜台换货"
+                    "交给原工单客户，不能走授信取件", 409)
             if cp["status"] == "delivered":
                 # 同一份换号也不能形成第二次交付或扣费
                 prior = _get(
@@ -1676,9 +1830,15 @@ def batch_view(conn, batch_id: str) -> dict:
     withdrawn = _withdrawn_by_batch(conn).get(batch_id, 0)
     committed = _demand_by_batch(conn, ("planned", "locked")).get(batch_id, 0)
     available = arrived - withdrawn
+    recall = _get(conn, "SELECT recalled_at,note FROM paper_batch_recalls "
+                        "WHERE batch_id=?", (batch_id,))
     return {"batch_id": batch_id, "arrived": arrived, "withdrawn": withdrawn,
             "available": available, "committed_original": committed,
-            "slack": available - committed}
+            "slack": available - committed,
+            "recalled": recall is not None,
+            "permanently_recalled": recall is not None,
+            "recalled_at": recall["recalled_at"] if recall else None,
+            "recall_note": recall["note"] if recall else None}
 
 
 def list_batches(conn) -> list[dict]:
@@ -1809,6 +1969,907 @@ def cancel_copy(conn, job_id: str, copy_no: int) -> dict:
             "freed_batch": cm["batch_id"],
             "cancelled_dispatches": cancelled_n})
     return job_commitments(conn, job_id)
+
+
+# ---------------------------------------------------------------------------
+# 批次召回、备品补制、柜台换货
+# ---------------------------------------------------------------------------
+
+def recall_batch(conn, batch_id: str, note: str | None = None,
+                 **kwargs) -> dict:
+    """库管把已登记纸批标记为永久召回。重复标记幂等返回。"""
+    if note is None:
+        note = kwargs.get("reason")
+    # 永久召回是当前唯一支持的召回类型；接受 permanent=True 仅为调用兼容。
+    kwargs.get("permanent", True)
+    batch_id = (batch_id or "").strip()
+    if not batch_id:
+        raise DomainError("invalid_recall", "批次编号不能为空", 400)
+    with WriteTx(conn) as c:
+        existing = _get(c, "SELECT * FROM paper_batch_recalls "
+                           "WHERE batch_id=?", (batch_id,))
+        if existing is not None:
+            row = dict(existing)
+        else:
+            registered = _get(
+                c, "SELECT 1 FROM stock_arrivals WHERE batch_id=? LIMIT 1",
+                (batch_id,))
+            if registered is None:
+                raise DomainError(
+                    "batch_not_registered",
+                    f"纸批 {batch_id} 尚未登记到货，不能标记召回；"
+                    "请先由库管登记该纸批", 404)
+            now = utcnow()
+            c.execute(
+                "INSERT INTO paper_batch_recalls(batch_id,status,note,"
+                "recalled_at) VALUES (?,'recalled',?,?)",
+                (batch_id, note, now))
+            log_event(c, "paper_batch_recalled", {
+                "batch_id": batch_id, "note": note, "permanent": True})
+            row = dict(_get(c, "SELECT * FROM paper_batch_recalls "
+                               "WHERE batch_id=?", (batch_id,)))
+    return _recall_view(conn, row)
+
+
+# 常见命名别名，便于不同调用方/测试意图直接命中。
+mark_batch_recalled = recall_batch
+recall_paper_batch = recall_batch
+
+
+def _recall_view(conn, row: dict) -> dict:
+    out = dict(row)
+    out["recalled"] = True
+    out["permanently_recalled"] = True
+    out["permanent"] = True
+    out["pending_copies"] = list_recall_pending(
+        conn, batch_id=row["batch_id"])
+    out["pending_count"] = len(out["pending_copies"])
+    return out
+
+
+def get_recall(conn, batch_id: str) -> dict:
+    row = row_to_dict(_get(
+        conn, "SELECT * FROM paper_batch_recalls WHERE batch_id=?",
+        (batch_id,)))
+    if row is None:
+        raise DomainError("recall_not_found",
+                          f"纸批 {batch_id} 没有召回记录", 404)
+    return _recall_view(conn, row)
+
+
+def list_recalls(conn) -> list[dict]:
+    rows = _all(conn, "SELECT * FROM paper_batch_recalls "
+                      "ORDER BY recalled_at, batch_id")
+    return [_recall_view(conn, r) for r in rows]
+
+
+def recall_dashboard(conn, job_id: str | None = None) -> dict:
+    """一个柜台/库管总览：召回批、待收回名单、当前持有和换货记录。"""
+    return {
+        "recalls": list_recalls(conn),
+        "pending": list_recall_pending(conn, job_id=job_id),
+        "holdings": list_holdings(conn, job_id)["holdings"],
+        "exchanges": list_copy_exchanges(conn, job_id),
+        "spares": list_spare_copies(conn, job_id),
+    }
+
+
+def _normalize_batch_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    elif not isinstance(value, (list, tuple, set)):
+        value = [value]
+    return sorted({str(b).strip() for b in value if str(b).strip()})
+
+
+def create_spare_copies(conn, *args, **kwargs) -> dict:
+    """按原工单补制若干份共用备品并指定可用纸批。
+
+    支持常见位置形式 ``(conn, job_id, count, [batches])`` 以及批次/份数
+    参数顺序互换。备品仍创建普通 page_slots/dispatches/copy_commitments，
+    因此照常领纸、派工、核对、补打和受库存承诺约束；但
+    copy_kind='spare'，普通/授信入口不能交付，只能由换货事务交给原工单客户。
+    """
+    job_id = kwargs.pop("job_id", None) or kwargs.pop("job", None)
+    pos = list(args)
+    if pos and isinstance(pos[0], str) and job_id is None:
+        job_id = pos.pop(0)
+
+    copy_count = (kwargs.pop("copy_count", None)
+                  or kwargs.pop("spare_count", None)
+                  or kwargs.pop("copies_count", None)
+                  or kwargs.pop("number_of_copies", None)
+                  or kwargs.pop("quantity", None)
+                  or kwargs.pop("copies", None)
+                  or kwargs.pop("n", None)
+                  or kwargs.pop("count", None))
+    page_count = kwargs.pop("page_count", None) or kwargs.pop("pages", None)
+    note = kwargs.pop("note", None)
+    reason = kwargs.pop("reason", None)
+    allowed_batches = kwargs.pop("allowed_batches", None)
+    batch_id = kwargs.pop("batch_id", None)
+    batch_ids = kwargs.pop("batch_ids", None)
+    batches = kwargs.pop("batches", None)
+
+    ints: list[int] = []
+    for a in pos:
+        if isinstance(a, int) and not isinstance(a, bool):
+            ints.append(a)
+        elif isinstance(a, str):
+            # 单个字符串既可能是 job（已处理），也可能是单个批次。
+            allowed_batches = [a] if allowed_batches is None \
+                else _normalize_batch_list(allowed_batches) + [a]
+        elif isinstance(a, (list, tuple, set)):
+            allowed_batches = a if allowed_batches is None \
+                else _normalize_batch_list(allowed_batches) \
+                + _normalize_batch_list(a)
+    if copy_count is None and ints:
+        copy_count = ints[0]
+    if page_count is None and len(ints) >= 2:
+        page_count = ints[1]
+    if copy_count is None:
+        copy_count = 1
+    try:
+        copy_count = int(copy_count)
+    except (TypeError, ValueError) as exc:
+        raise DomainError("invalid_spare_count",
+                          "备品份数必须是正整数", 400) from exc
+    if copy_count <= 0:
+        raise DomainError("invalid_spare_count",
+                          "备品份数必须是正整数", 400)
+
+    requested_batches = _normalize_batch_list(allowed_batches)
+    for v in (batch_ids, batches):
+        requested_batches += [b for b in _normalize_batch_list(v)
+                              if b not in requested_batches]
+    if batch_id:
+        b = batch_id.strip() if isinstance(batch_id, str) else batch_id
+        if b and b not in requested_batches:
+            requested_batches.append(b)
+
+    with WriteTx(conn) as c:
+        job = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                               (job_id,)))
+        if job is None:
+            raise DomainError("job_not_found", f"工单 {job_id} 不存在", 404)
+        if page_count is not None and int(page_count) != job["page_count"]:
+            raise DomainError(
+                "page_count_mismatch",
+                f"备品必须与原工单同页数：原工单 {job['page_count']} 页，"
+                f"请求 {page_count} 页", 400)
+        if not _is_tracked(c, job_id):
+            raise DomainError(
+                "not_batch_tracked",
+                f"工单 {job_id} 未纳入纸料追踪，不能按纸批补制召回备品；"
+                "旧工单仍按原流程办理", 409)
+        if not requested_batches:
+            requested_batches = _allowed_batches(c, job_id)
+        requested_batches = sorted(set(requested_batches))
+        if not requested_batches:
+            raise DomainError(
+                "batches_required",
+                "补制备品必须指定至少一个可用纸批", 400)
+        recalled = _recalled_batch_ids(c)
+        forbidden = [b for b in requested_batches if b in recalled]
+        if forbidden:
+            raise DomainError(
+                "batch_recalled",
+                f"不能指定已永久召回批次 {forbidden} 制作品格备品", 409)
+
+        next_no = _get(
+            c, "SELECT COALESCE(MAX(copy_no),0)+1 AS n FROM job_copies "
+               "WHERE job_id=?", (job_id,))["n"]
+        copy_nos = list(range(next_no, next_no + copy_count))
+
+        # 与接单相同的整体可行性求解：不挤掉已接工单/已有份的原印承诺，
+        # 并允许重排未开印份。
+        planned = _planned_items(c)
+        new_items = [{"key": (job_id, no),
+                      "demand": job["page_count"],
+                      "allowed": list(requested_batches)}
+                     for no in copy_nos]
+        assignment = _solve_assignment(
+            _available_by_batch(c),
+            _demand_by_batch(c, ("locked",)),
+            planned + new_items)
+        if assignment is None:
+            raise DomainError(
+                "insufficient_stock",
+                f"备品 {copy_count} 份 × {job['page_count']} 页在指定批次 "
+                f"{requested_batches} 中没有可行的整份安排", 409)
+
+        now = utcnow()
+        # 落实求解器对既有未开印份的重排。
+        for (j, no), b in assignment.items():
+            if (j, no) in {(job_id, n) for n in copy_nos}:
+                continue
+            cur = _get(c, "SELECT batch_id FROM copy_commitments "
+                          "WHERE job_id=? AND copy_no=?", (j, no))
+            if cur is not None and cur["batch_id"] != b:
+                c.execute(
+                    "UPDATE copy_commitments SET batch_id=? "
+                    "WHERE job_id=? AND copy_no=?", (b, j, no))
+                log_event(c, "copy_batch_reassigned", {
+                    "job_id": j, "copy_no": no,
+                    "from_batch": cur["batch_id"], "to_batch": b,
+                    "reason": "spare_accept_replan", "by_job": job_id})
+
+        for no in copy_nos:
+            c.execute(
+                "INSERT INTO job_copies(job_id,copy_no,copy_kind,status) "
+                "VALUES (?,?,'spare','pending')", (job_id, no))
+            for page_no in range(1, job["page_count"] + 1):
+                c.execute(
+                    "INSERT INTO page_slots(job_id,copy_no,page_no,status) "
+                    "VALUES (?,?,?,'pending')",
+                    (job_id, no, page_no))
+                c.execute(
+                    "INSERT INTO dispatches(dispatch_id,job_id,copy_no,"
+                    "page_no,attempt_no,status,created_at) "
+                    "VALUES (?,?,?,?,1,'queued',?)",
+                    (_new_id("dsp"), job_id, no, page_no, now))
+            for b in requested_batches:
+                c.execute(
+                    "INSERT OR IGNORE INTO copy_allowed_batches("
+                    "job_id,copy_no,batch_id) VALUES (?,?,?)",
+                    (job_id, no, b))
+            batch_id = assignment[(job_id, no)]
+            c.execute(
+                "INSERT INTO copy_commitments(job_id,copy_no,status,"
+                "batch_id) VALUES (?,?,'planned',?)",
+                (job_id, no, batch_id))
+
+        log_event(c, "spare_copies_created", {
+            "job_id": job_id, "copy_nos": copy_nos,
+            "copy_count": copy_count, "page_count": job["page_count"],
+            "allowed_batches": requested_batches,
+            "assignment": {str(no): assignment[(job_id, no)]
+                           for no in copy_nos},
+            "note": note or reason})
+
+    spare_view = list_spare_copies(conn, job_id, copy_nos=copy_nos)
+    rows = spare_view["spares"]
+    return {"job_id": job_id, "copy_count": copy_count,
+            "copy_nos": copy_nos,
+            "spare_ids": [f"SPARE-{job_id}-{n}" for n in copy_nos],
+            "spare_copies": rows,
+            "spares": rows,
+            "assignment": {str(no): assignment[(job_id, no)]
+                           for no in copy_nos}}
+
+
+# 常见命名别名。
+create_spares = create_spare_copies
+create_spare_copy = create_spare_copies
+create_spares_for_job = create_spare_copies
+produce_spare_copies = create_spare_copies
+add_spare_copies = create_spare_copies
+
+
+def list_spare_copies(conn, job_id: str | None = None, *,
+                      copy_nos: list[int] | None = None,
+                      only_available: bool = False) -> dict | list[dict]:
+    sql = ("SELECT j.job_id, j.title, j.page_count, jc.copy_no, "
+           "jc.status AS copy_status, jc.copy_kind, jc.paused_reason, "
+           "cc.status AS commitment_status, cc.batch_id, "
+           "cu.status AS custody_status, ce.request_id AS exchange_id "
+           "FROM job_copies jc JOIN jobs j ON j.job_id=jc.job_id "
+           "LEFT JOIN copy_commitments cc ON cc.job_id=jc.job_id "
+           "AND cc.copy_no=jc.copy_no "
+           "LEFT JOIN copy_custody cu ON cu.physical_job_id=jc.job_id "
+           "AND cu.physical_copy_no=jc.copy_no "
+           "LEFT JOIN copy_exchanges ce ON ce.spare_job_id=jc.job_id "
+           "AND ce.spare_copy_no=jc.copy_no "
+           "WHERE COALESCE(jc.copy_kind,'original')='spare'")
+    params: list = []
+    if job_id is not None:
+        sql += " AND jc.job_id=?"
+        params.append(job_id)
+    if copy_nos:
+        marks = ",".join("?" for _ in copy_nos)
+        sql += f" AND jc.copy_no IN ({marks})"
+        params.extend(copy_nos)
+    if only_available:
+        sql += " AND jc.status NOT IN ('delivered','cancelled') " \
+               "AND ce.request_id IS NULL"
+    sql += " ORDER BY j.job_id,jc.copy_no"
+    rows = _all(conn, sql, params)
+    for r in rows:
+        r["spare_id"] = f"SPARE-{r['job_id']}-{r['copy_no']}"
+        r["allowed_batches"] = _allowed_batches(
+            conn, r["job_id"], r["copy_no"])
+        try:
+            _, slots = _check_deliverable(
+                conn, {"job_id": r["job_id"],
+                       "page_count": r["page_count"]},
+                r["copy_no"], allow_spare=True)
+            r["exchange_ready"] = True
+            r["blocking_slots"] = []
+        except DomainError as exc:
+            r["exchange_ready"] = False
+            r["readiness_error"] = exc.code
+            slots = _all(
+                conn, "SELECT page_no,status FROM page_slots "
+                      "WHERE job_id=? AND copy_no=? AND status<>'verified'",
+                (r["job_id"], r["copy_no"]))
+            r["blocking_slots"] = slots
+    if job_id is not None:
+        return {"job_id": job_id, "spares": rows}
+    return rows
+
+
+def _current_custody(c, job_id: str, copy_no: int) -> dict | None:
+    """按逻辑原交付份号或当前物理份号找唯一在手持有关系。"""
+    row = _get(
+        c,
+        "SELECT * FROM copy_custody WHERE logical_job_id=? "
+        "AND logical_copy_no=? AND status='with_customer'",
+        (job_id, copy_no))
+    if row is not None:
+        return dict(row)
+    row = _get(
+        c,
+        "SELECT * FROM copy_custody WHERE physical_job_id=? "
+        "AND physical_copy_no=? AND status='with_customer'",
+        (job_id, copy_no))
+    if row is not None:
+        return dict(row)
+    # 传入的是已退回的旧物理份时，沿其 logical 指针找到当前在手份。
+    old = _get(
+        c,
+        "SELECT * FROM copy_custody WHERE physical_job_id=? "
+        "AND physical_copy_no=?", (job_id, copy_no))
+    if old is not None:
+        row = _get(
+            c,
+            "SELECT * FROM copy_custody WHERE logical_job_id=? "
+            "AND logical_copy_no=? AND status='with_customer'",
+            (old["logical_job_id"], old["logical_copy_no"]))
+        if row is not None:
+            return dict(row)
+    return None
+
+
+def list_holdings(conn, job_id: str | None = None, *,
+                  include_returned: bool = False) -> dict:
+    where = []
+    params: list = []
+    if not include_returned:
+        where.append("cu.status='with_customer'")
+    if job_id is not None:
+        where.append("(cu.logical_job_id=? OR cu.physical_job_id=?)")
+        params.extend([job_id, job_id])
+    sql = ("SELECT cu.*, j.title, j.page_count, j.credit_account_id, "
+           "j.price_per_copy FROM copy_custody cu "
+           "JOIN jobs j ON j.job_id=cu.logical_job_id")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY cu.logical_job_id,cu.logical_copy_no," \
+           "cu.physical_copy_no"
+    rows = _all(conn, sql, params)
+    for row in rows:
+        ret_bad = _recalled_usage(
+            conn, row["physical_job_id"], row["physical_copy_no"])
+        row["current_paper_usage"] = _copy_paper_usage(
+            conn, row["physical_job_id"], row["physical_copy_no"])
+        row["recalled_usage"] = ret_bad
+        row["recalled_batches"] = sorted(
+            {u["batch_id"] for u in ret_bad if u.get("batch_id")})
+        row["pending_recall"] = bool(ret_bad)
+        row["exchange_count"] = _get(
+            conn, "SELECT COUNT(*) AS n FROM copy_exchanges "
+                  "WHERE job_id=? AND original_copy_no=?",
+            (row["logical_job_id"], row["logical_copy_no"]))["n"]
+    return {"holdings": rows}
+
+
+def list_recall_pending(conn, batch_id: str | None = None,
+                        job_id: str | None = None) -> list[dict]:
+    """当前在手且实际用纸含永久召回批次的逻辑原交付份。
+
+    换出合格备品后，当前 custody 指向新物理份；旧批次自然不再命中。备品
+    日后被召回时，同一 logical 原交付份会用上次换出的纸再次出现。
+    """
+    holdings = list_holdings(conn, job_id)["holdings"]
+    out = []
+    for h in holdings:
+        bad = h["recalled_usage"]
+        if not bad:
+            continue
+        if batch_id is not None and not any(
+                u.get("batch_id") == batch_id for u in bad):
+            continue
+        usage = h["current_paper_usage"]
+        batches: dict[str, dict] = {}
+        for u in bad:
+            b = u["batch_id"]
+            item = batches.setdefault(b, {
+                "batch_id": b,
+                "recalled_paper_ids": [],
+                "recalled_page_numbers": []})
+            item["recalled_paper_ids"].append(u["paper_id"])
+            item["recalled_page_numbers"].append(u["page_no"])
+        for b in batches.values():
+            recall = _get(conn, "SELECT recalled_at,note FROM "
+                               "paper_batch_recalls WHERE batch_id=?",
+                          (b["batch_id"],))
+            b["recalled_at"] = recall["recalled_at"] if recall else None
+            b["note"] = recall["note"] if recall else None
+        paper_ids = [u["paper_id"] for u in usage]
+        out.append({
+            "job_id": h["logical_job_id"],
+            "title": h.get("title"),
+            "credit_account_id": h.get("credit_account_id"),
+            "original_copy_no": h["logical_copy_no"],
+            "logical_job_id": h["logical_job_id"],
+            "logical_copy_no": h["logical_copy_no"],
+            "current_job_id": h["physical_job_id"],
+            "current_copy_no": h["physical_copy_no"],
+            "held_copy_no": h["physical_copy_no"],
+            "physical_job_id": h["physical_job_id"],
+            "physical_copy_no": h["physical_copy_no"],
+            "status": "pending_return",
+            "pending_reason": (
+                "客户当前在手份使用了永久召回纸批："
+                + ",".join(sorted({u['batch_id'] for u in bad
+                                    if u.get('batch_id')}))),
+            "recalled_batches": list(batches.values()),
+            "recalled_paper_ids": [u["paper_id"] for u in bad],
+            "delivery_items": usage,
+            "paper_ids": paper_ids,
+            "expected_recovered_paper_ids": paper_ids,
+            "exchange_count": h["exchange_count"],
+        })
+    return out
+
+
+# 常见查询别名。
+recall_pending_copies = list_recall_pending
+pending_recalls = list_recall_pending
+list_pending_returns = list_recall_pending
+
+
+def get_copy_recall_view(conn, job_id: str, copy_no: int) -> dict:
+    """区分当前在手物理份、召回原因、交付清单和历次换货。"""
+    job = row_to_dict(_get(conn, "SELECT * FROM jobs WHERE job_id=?",
+                           (job_id,)))
+    if job is None:
+        raise DomainError("job_not_found", f"工单 {job_id} 不存在", 404)
+    with WriteTx(conn) as c:
+        custody = _current_custody(c, job_id, copy_no)
+    if custody is None:
+        # 可能是从未交付的份/备品：返回状态而不是 404，便于柜台查询。
+        cp = row_to_dict(_get(
+            conn, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
+            (job_id, copy_no)))
+        if cp is None:
+            raise DomainError("copy_not_found", "份不存在", 404)
+        return {"job_id": job_id, "query_copy_no": copy_no,
+                "in_hand": False, "current_holding": None,
+                "pending_recall": False, "recall_reasons": [],
+                "exchanges": list_copy_exchanges(conn, job_id, copy_no)}
+    logical_job = custody["logical_job_id"]
+    logical_no = custody["logical_copy_no"]
+    pending = [p for p in list_recall_pending(conn, job_id=logical_job)
+               if p["logical_copy_no"] == logical_no]
+    exchanges = list_copy_exchanges(conn, logical_job, logical_no)
+    current_list = delivery_list(
+        conn, custody["physical_job_id"], custody["physical_copy_no"])
+    original_list = delivery_list(conn, logical_job, logical_no)
+    return {
+        "job_id": logical_job,
+        "original_copy_no": logical_no,
+        "query_copy_no": copy_no,
+        "in_hand": custody["status"] == "with_customer",
+        "current_holding": custody,
+        "current_delivery_list": current_list["items"],
+        "original_delivery_list": original_list["items"],
+        "pending_recall": bool(pending),
+        "recall_reasons": pending,
+        "exchanges": exchanges,
+        "exchange_count": len(exchanges),
+    }
+
+
+copy_recall_status = get_copy_recall_view
+copy_history = get_copy_recall_view
+
+
+def current_delivery_list(conn, job_id: str, copy_no: int) -> dict:
+    """按逻辑原交付份号或物理份号返回客户当前持有份的冻结清单。"""
+    custody = _current_custody(conn, job_id, copy_no)
+    if custody is None:
+        # 兼容尚未发生换货、但 custody 回填缺失的极端旧库。
+        items = delivery_list(conn, job_id, copy_no)
+        if items["items"]:
+            return {**items, "current_job_id": job_id,
+                    "current_copy_no": copy_no}
+        raise DomainError("holding_not_found",
+                          "该份当前不在客户手中", 404)
+    result = delivery_list(
+        conn, custody["physical_job_id"], custody["physical_copy_no"])
+    result.update({
+        "logical_job_id": custody["logical_job_id"],
+        "logical_copy_no": custody["logical_copy_no"],
+        "current_job_id": custody["physical_job_id"],
+        "current_copy_no": custody["physical_copy_no"],
+        "custody": custody})
+    return result
+
+
+def _exchange_payload_kwargs(args, kwargs) -> dict:
+    """把多种符合业务语义的位置/关键字调用归一化。"""
+    kw = dict(kwargs)
+    out = {
+        "request_id": kw.pop("request_id", None)
+        or kw.pop("exchange_request_id", None)
+        or kw.pop("request_no", None)
+        or kw.pop("exchange_request_no", None)
+        or kw.pop("idempotency_key", None)
+        or kw.pop("exchange_no", None)
+        or kw.pop("exchange_id", None),
+        "job_id": kw.pop("job_id", None) or kw.pop("job", None),
+        "original_copy_no": kw.pop("original_copy_no", None)
+        or kw.pop("copy_no", None) or kw.pop("original_copy", None)
+        or kw.pop("original_copy_id", None) or kw.pop("copy_id", None)
+        or kw.pop("copy", None),
+        "returned_copy_no": kw.pop("returned_copy_no", None)
+        or kw.pop("held_copy_no", None)
+        or kw.pop("current_copy_no", None)
+        or kw.pop("from_copy_no", None),
+        "spare_copy_no": kw.pop("spare_copy_no", None)
+        or kw.pop("spare_no", None) or kw.pop("spare_copy", None)
+        or kw.pop("spare_id", None) or kw.pop("spare_copy_id", None)
+        or kw.pop("spare", None),
+        "recovered_paper_ids": kw.pop("recovered_paper_ids", None)
+        or kw.pop("returned_paper_ids", None)
+        or kw.pop("recovered_papers", None)
+        or kw.pop("papers", None)
+        or kw.pop("paper_ids", None)
+        or kw.pop("returned_papers", None)
+        or kw.pop("collected_paper_ids", None),
+        "spare_job_id": kw.pop("spare_job_id", None),
+    }
+    args = list(args)
+    ints: list[int] = []
+    strings: list[str] = []
+    papers = None
+    for a in args:
+        if isinstance(a, (list, tuple, set)):
+            papers = list(a)
+        elif isinstance(a, int) and not isinstance(a, bool):
+            ints.append(a)
+        elif isinstance(a, str):
+            strings.append(a)
+    if out["recovered_paper_ids"] is None and papers is not None:
+        out["recovered_paper_ids"] = papers
+    # 常见位置形式：
+    # (job_id, original_copy_no, [papers], spare_copy_no, request_id)
+    # (request_id, job_id, original_copy_no, spare_copy_no, [papers])
+    if out["job_id"] is None and strings:
+        # 无法仅靠字符串区分 job/request；若第一个位置参数是字符串且第二
+        # 个也是字符串，按 request_id,job_id 处理，否则第一个是 job_id。
+        if args and isinstance(args[0], str) and len(args) >= 2 \
+                and isinstance(args[1], str):
+            out["request_id"] = out["request_id"] or args[0]
+            out["job_id"] = args[1]
+        else:
+            out["job_id"] = strings[0]
+            if out["request_id"] is None and len(strings) >= 2:
+                out["request_id"] = strings[-1]
+    elif out["request_id"] is None and strings:
+        out["request_id"] = strings[0]
+    if out["original_copy_no"] is None and ints:
+        out["original_copy_no"] = ints[0]
+    if out["spare_copy_no"] is None and len(ints) >= 2:
+        out["spare_copy_no"] = ints[1]
+    return out
+
+
+def exchange_copy(conn, *args, **kwargs) -> dict:
+    """柜台原子换货：收回当前待召回整份 + 交出合格备品，同请求号幂等。"""
+    p = _exchange_payload_kwargs(args, kwargs)
+    request_id = (p["request_id"] or "").strip() \
+        if isinstance(p["request_id"], str) else p["request_id"]
+    job_id = (p["job_id"] or "").strip() \
+        if isinstance(p["job_id"], str) else p["job_id"]
+    original_input = p["original_copy_no"]
+    spare_copy_no = p["spare_copy_no"]
+    returned_copy_no = p["returned_copy_no"]
+    spare_job_id = p["spare_job_id"] or job_id
+    raw_papers = p["recovered_paper_ids"]
+
+    if not request_id or not isinstance(request_id, str):
+        raise DomainError("request_id_required",
+                          "换货必须提交换货请求号", 400)
+    if not job_id or not isinstance(job_id, str):
+        raise DomainError("job_id_required", "换货必须指定原工单", 400)
+    try:
+        original_input = _coerce_copy_no(original_input)
+        spare_copy_no = _coerce_copy_no(spare_copy_no)
+    except (TypeError, ValueError) as exc:
+        raise DomainError("invalid_copy_no",
+                          "原交付份号与备品份号必须是整数", 400) from exc
+    if returned_copy_no is not None:
+        returned_copy_no = _coerce_copy_no(returned_copy_no)
+    if spare_job_id != job_id:
+        raise DomainError(
+            "spare_job_mismatch",
+            "当前实现的备品均补制在原工单下；不能选择其他工单的备品", 409)
+    if not isinstance(raw_papers, (list, tuple, set)) or not raw_papers:
+        raise DomainError(
+            "recovered_papers_required",
+            "必须提交现场收回的整份纸张编号（非空数组）", 400)
+    def _paper_id_value(item):
+        if isinstance(item, dict):
+            return item.get("paper_id") or item.get("id") \
+                or item.get("paperId")
+        return item
+
+    recovered_ids = [str(_paper_id_value(x)).strip()
+                     for x in raw_papers
+                     if str(_paper_id_value(x) or "").strip()]
+    if len(recovered_ids) != len(set(recovered_ids)):
+        raise DomainError("duplicate_paper_id",
+                          "收回纸张编号不能重复", 400)
+
+    paper_set = sorted(set(recovered_ids))
+    now = utcnow()
+
+    with WriteTx(conn) as c:
+        old = row_to_dict(_get(
+            c, "SELECT * FROM copy_exchanges WHERE request_id=?",
+            (request_id,)))
+        if old is not None:
+            old_papers = json.loads(old["recovered_paper_ids"])
+            same_core = (
+                old["job_id"] == job_id
+                and (old["original_copy_no"] == original_input
+                     # 也允许重送时传当前物理份号而不是逻辑原份号。
+                     or old["returned_copy_no"] == original_input)
+                and old["spare_job_id"] == spare_job_id
+                and old["spare_copy_no"] == spare_copy_no
+                and old_papers == paper_set
+                and (returned_copy_no is None
+                     or returned_copy_no == old["returned_copy_no"])
+            )
+            if not same_core:
+                raise DomainError(
+                    "request_id_conflict",
+                    f"换货请求号 {request_id} 已用于不同的换货内容；"
+                    "同号不能改换工单、份号、纸号或备品", 409)
+            snapshot = json.loads(old["result_json"])
+            snapshot["idempotent_replay"] = True
+            snapshot["replayed"] = True
+            return snapshot
+
+        job = row_to_dict(_get(c, "SELECT * FROM jobs WHERE job_id=?",
+                               (job_id,)))
+        if job is None:
+            raise DomainError("job_not_found", f"工单 {job_id} 不存在", 404)
+        if not _is_tracked(c, job_id):
+            raise DomainError(
+                "not_batch_tracked",
+                f"工单 {job_id} 未纳入纸料追踪，不存在本功能的批次召回"
+                "待收回换货；旧工单照旧办理", 409)
+
+        custody = _current_custody(c, job_id, original_input)
+        if custody is None:
+            raise DomainError(
+                "copy_not_in_hand",
+                f"工单 {job_id} 份 {original_input} 没有当前在客户手中的"
+                "交付记录，不能换货收回", 409)
+        logical_job = custody["logical_job_id"]
+        logical_copy_no = custody["logical_copy_no"]
+        ret_job_id = custody["physical_job_id"]
+        ret_copy_no = custody["physical_copy_no"]
+        if logical_job != job_id:
+            raise DomainError("job_mismatch", "当前持有份不属于该工单", 409)
+        if returned_copy_no is not None \
+                and returned_copy_no != ret_copy_no:
+            raise DomainError(
+                "returned_copy_mismatch",
+                f"请求收回份 {returned_copy_no} 不是客户当前在手份 "
+                f"{ret_copy_no}", 409)
+
+        recalled_bad = _recalled_usage(c, ret_job_id, ret_copy_no)
+        if not recalled_bad:
+            raise DomainError(
+                "copy_not_pending_recall",
+                f"工单 {job_id} 当前在手物理份 {ret_copy_no} 没有使用任何"
+                "已召回批次，不在待收回名单中，不能走召回换货", 409)
+
+        old_items = _all(
+            c, "SELECT * FROM delivery_items WHERE job_id=? AND copy_no=? "
+               "ORDER BY page_no", (ret_job_id, ret_copy_no))
+        if not old_items:
+            raise DomainError(
+                "delivery_list_not_found",
+                "当前在手份没有冻结的交付清单，无法核对收回纸号", 409)
+        expected_ids = sorted(i["paper_id"] for i in old_items)
+        if paper_set != expected_ids or len(recovered_ids) != len(old_items):
+            raise DomainError(
+                "recovered_paper_mismatch",
+                "必须按交付清单收回客户当前持有的一整份；"
+                f"应交回纸号 {expected_ids}，实际提交 {paper_set}", 409)
+
+        spare_cp = row_to_dict(_get(
+            c, "SELECT * FROM job_copies WHERE job_id=? AND copy_no=?",
+            (spare_job_id, spare_copy_no)))
+        if spare_cp is None:
+            raise DomainError("spare_not_found",
+                              f"备品份 {spare_job_id}#{spare_copy_no} 不存在",
+                              404)
+        if spare_cp.get("copy_kind") != "spare":
+            raise DomainError(
+                "not_a_spare_copy",
+                f"工单 {job_id} 份 {spare_copy_no} 不是补制备品份", 409)
+        prior_use = _get(
+            c, "SELECT request_id FROM copy_exchanges "
+               "WHERE spare_job_id=? AND spare_copy_no=?",
+            (spare_job_id, spare_copy_no))
+        if prior_use is not None:
+            raise DomainError(
+                "spare_already_used",
+                f"备品份 {spare_copy_no} 已在换货 {prior_use['request_id']} "
+                "中交给客户，不能第二次使用", 409)
+
+        # 原有整份交付条件 + 实际批次未召回，均在同一写事务内复查。
+        _, slots = _check_deliverable(
+            c, job, spare_copy_no, allow_spare=True)
+        delivered = _record_delivery(
+            c, spare_job_id, spare_copy_no, slots,
+            request_id=request_id, exchange_id=request_id)
+
+        cur = c.execute(
+            "UPDATE copy_custody SET status='returned', returned_at=?, "
+            "return_exchange_id=? WHERE physical_job_id=? "
+            "AND physical_copy_no=? AND status='with_customer'",
+            (now, request_id, ret_job_id, ret_copy_no))
+        if cur.rowcount != 1:
+            raise DomainError(
+                "return_concurrent_conflict",
+                "当前在手份已被其他换货事务收回", 409)
+        cur = c.execute(
+            "UPDATE copy_custody SET logical_job_id=?, logical_copy_no=?, "
+            "out_exchange_id=? WHERE physical_job_id=? "
+            "AND physical_copy_no=? AND status='with_customer'",
+            (logical_job, logical_copy_no, request_id,
+             spare_job_id, spare_copy_no))
+        if cur.rowcount != 1:
+            raise DomainError(
+                "spare_custody_conflict",
+                "备品持有关系更新失败", 409)
+
+        recalled_batches = sorted(
+            {u["batch_id"] for u in recalled_bad if u.get("batch_id")})
+        result = {
+            "request_id": request_id,
+            "exchange_id": request_id,
+            "status": "completed",
+            "job_id": job_id,
+            "original_copy_no": logical_copy_no,
+            "logical_job_id": logical_job,
+            "logical_copy_no": logical_copy_no,
+            "submitted_copy_no": original_input,
+            "returned_job_id": ret_job_id,
+            "returned_copy_no": ret_copy_no,
+            "recovered_paper_ids": paper_set,
+            "returned_delivery_items": old_items,
+            "recalled_batches": recalled_batches,
+            "spare_job_id": spare_job_id,
+            "spare_copy_no": spare_copy_no,
+            "spare_id": f"SPARE-{spare_job_id}-{spare_copy_no}",
+            "spare_delivery_items": delivered["items"],
+            "items": delivered["items"],
+            "delivered_at": now,
+            "current_job_id": spare_job_id,
+            "current_copy_no": spare_copy_no,
+            "idempotent_replay": False,
+        }
+        fingerprint = json.dumps({
+            "request_id": request_id, "job_id": job_id,
+            "original_copy_no": logical_copy_no,
+            "returned_job_id": ret_job_id,
+            "returned_copy_no": ret_copy_no,
+            "spare_job_id": spare_job_id,
+            "spare_copy_no": spare_copy_no,
+            "papers": paper_set}, sort_keys=True, separators=(",", ":"))
+        c.execute(
+            "INSERT INTO copy_exchanges(request_id,job_id,"
+            "original_copy_no,returned_job_id,returned_copy_no,"
+            "spare_job_id,spare_copy_no,recovered_paper_ids,"
+            "request_fingerprint,result_json,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (request_id, job_id, logical_copy_no, ret_job_id,
+             ret_copy_no, spare_job_id, spare_copy_no,
+             json.dumps(paper_set, ensure_ascii=False), fingerprint,
+             json.dumps(result, ensure_ascii=False, sort_keys=True), now))
+        log_event(c, "copy_exchanged", {
+            "request_id": request_id, "job_id": job_id,
+            "original_copy_no": logical_copy_no,
+            "returned_copy_no": ret_copy_no,
+            "recovered_paper_ids": paper_set,
+            "spare_copy_no": spare_copy_no})
+        return result
+
+
+counter_exchange = exchange_copy
+create_exchange = exchange_copy
+submit_exchange = exchange_copy
+
+
+def get_exchange(conn, request_id: str) -> dict:
+    row = row_to_dict(_get(
+        conn, "SELECT * FROM copy_exchanges WHERE request_id=?",
+        (request_id,)))
+    if row is None:
+        raise DomainError("exchange_not_found",
+                          f"换货请求 {request_id} 不存在", 404)
+    result = json.loads(row["result_json"])
+    result["record"] = {k: v for k, v in row.items() if k != "result_json"}
+    return result
+
+
+def list_copy_exchanges(conn, job_id: str | None = None,
+                        copy_no: int | None = None) -> list[dict]:
+    sql = "SELECT * FROM copy_exchanges"
+    params: list = []
+    clauses = []
+    if job_id is not None:
+        clauses.append("job_id=?")
+        params.append(job_id)
+    if copy_no is not None:
+        clauses.append("(original_copy_no=? OR returned_copy_no=? "
+                       "OR spare_copy_no=?)")
+        params.extend([copy_no, copy_no, copy_no])
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at,rowid"
+    rows = _all(conn, sql, params)
+    out = []
+    for row in rows:
+        item = json.loads(row["result_json"])
+        item["record"] = {k: v for k, v in row.items()
+                          if k not in ("result_json",)}
+        out.append(item)
+    return out
+
+
+# 查询函数的常见命名别名。
+list_exchanges = list_copy_exchanges
+list_exchange_requests = list_copy_exchanges
+exchange_history = list_copy_exchanges
+get_copy_history = get_copy_recall_view
+copy_holdings = list_holdings
+current_holdings = list_holdings
+customer_holdings = list_holdings
+pending_returns = list_recall_pending
+recall_list = list_recalls
+list_recall_records = list_recalls
+recalled_batches = list_recalls
+list_recalled_batches = list_recalls
+list_recall_candidates = list_recall_pending
+recall_candidates = list_recall_pending
+recall_pending = list_recall_pending
+pending_recall = list_recall_pending
+list_recall_queue = list_recall_pending
+list_spares = list_spare_copies
+
+
+def list_available_spares(conn, job_id: str | None = None):
+    return list_spare_copies(conn, job_id, only_available=True)
+
+
+make_spare_copies = create_spare_copies
+make_spare_copy = create_spare_copies
+prepare_spare_copies = create_spare_copies
+register_spare_copies = create_spare_copies
+perform_copy_exchange = exchange_copy
+request_copy_exchange = exchange_copy
+get_exchange_result = get_exchange
 
 
 # ---------------------------------------------------------------------------

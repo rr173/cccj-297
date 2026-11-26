@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import os
 
-import httpx
+try:  # HTTP 依赖在正常 requirements 环境中必然存在；保留惰性错误便于纯服务层测试
+    import httpx
+except ImportError:  # pragma: no cover - 仅最小 Python 环境会走到
+    httpx = None
 
 
 class FinanceUnavailable(Exception):
@@ -40,6 +43,8 @@ def _timeout() -> float:
 
 
 def _request(method: str, path: str, body: dict | None = None) -> dict:
+    if httpx is None:
+        raise FinanceUnavailable("财务 HTTP 客户端依赖 httpx 未安装")
     try:
         r = httpx.request(method, finance_base_url() + path, json=body,
                           timeout=_timeout())
@@ -57,6 +62,8 @@ def _request(method: str, path: str, body: dict | None = None) -> dict:
 
 
 def healthy() -> bool:
+    if httpx is None:
+        return False
     try:
         r = httpx.get(finance_base_url() + "/health", timeout=_timeout())
         return r.status_code == 200

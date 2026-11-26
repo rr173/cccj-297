@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS job_copies (
     job_id        TEXT NOT NULL REFERENCES jobs(job_id),
     copy_no       INTEGER NOT NULL CHECK (copy_no >= 1),
+    -- original=客户原工单份；spare=库管补制、只能经换货交出的备品份
+    copy_kind     TEXT NOT NULL DEFAULT 'original'
+                  CHECK (copy_kind IN ('original','spare')),
     status        TEXT NOT NULL DEFAULT 'pending'
                   -- pending 待处理 / ready 可交付 / delivered 已交付 /
                   -- paused 因矛盾暂停 / investigating 交付后追查 /
@@ -162,13 +165,17 @@ CREATE TABLE IF NOT EXISTS deactivations (
 
 -- 交付清单（只追加；交付后不回改）
 CREATE TABLE IF NOT EXISTS delivery_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id        TEXT NOT NULL,
     copy_no       INTEGER NOT NULL,
     page_no       INTEGER NOT NULL,
     paper_id      TEXT NOT NULL,
     dispatch_id   TEXT NOT NULL,
     delivered_at  TEXT NOT NULL,
-    PRIMARY KEY (job_id, copy_no, page_no)
+    -- 本次真实交付对应的取件/换货请求号（原非授信交付可为 NULL）
+    request_id    TEXT,
+    exchange_id   TEXT,
+    UNIQUE (job_id, copy_no, page_no)
 );
 
 -- 交付后出现的矛盾：只立追查，不改交付清单
@@ -211,6 +218,64 @@ CREATE TABLE IF NOT EXISTS copy_commitments (
     locked_at     TEXT,
     cancelled_at  TEXT,
     PRIMARY KEY (job_id, copy_no)
+);
+
+-- 某一份（主要是备品）创建时指定的可用批次；不存在时回退到工单级策略
+CREATE TABLE IF NOT EXISTS copy_allowed_batches (
+    job_id        TEXT NOT NULL,
+    copy_no       INTEGER NOT NULL,
+    batch_id      TEXT NOT NULL,
+    PRIMARY KEY (job_id, copy_no, batch_id)
+);
+
+-- 永久召回的纸批。只追加/只标记，不提供取消召回：事实长期可查。
+CREATE TABLE IF NOT EXISTS paper_batch_recalls (
+    batch_id      TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'recalled'
+                  CHECK (status IN ('recalled')),
+    note          TEXT,
+    recalled_at   TEXT NOT NULL
+);
+
+-- 物理份的客户持有关系。每次真实交付插入一个物理份；换货时旧物理份置
+-- returned，备品物理份的 logical_* 指向原交付份。当前在手查询只看
+-- status='with_customer'。
+CREATE TABLE IF NOT EXISTS copy_custody (
+    physical_job_id  TEXT NOT NULL,
+    physical_copy_no INTEGER NOT NULL,
+    logical_job_id   TEXT NOT NULL,
+    logical_copy_no  INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'with_customer'
+                     CHECK (status IN ('with_customer','returned')),
+    source_request_id TEXT,
+    out_exchange_id  TEXT,
+    delivered_at     TEXT NOT NULL,
+    returned_at      TEXT,
+    return_exchange_id TEXT,
+    PRIMARY KEY (physical_job_id, physical_copy_no)
+);
+
+-- 同一逻辑原交付份同一时刻只能有一个当前在手物理份
+CREATE UNIQUE INDEX IF NOT EXISTS idx_custody_active_logical
+    ON copy_custody(logical_job_id, logical_copy_no)
+    WHERE status = 'with_customer';
+
+-- 柜台换货请求（成功后持久化）。request_id 幂等；退回的在手份与交出的
+-- 备品都加唯一约束，结构性防止同一物理份被两次成功换货使用。
+CREATE TABLE IF NOT EXISTS copy_exchanges (
+    request_id             TEXT PRIMARY KEY,
+    job_id                 TEXT NOT NULL,
+    original_copy_no       INTEGER NOT NULL,
+    returned_job_id        TEXT NOT NULL,
+    returned_copy_no       INTEGER NOT NULL,
+    spare_job_id           TEXT NOT NULL,
+    spare_copy_no          INTEGER NOT NULL,
+    recovered_paper_ids    TEXT NOT NULL,  -- JSON 数组，按纸号排序
+    request_fingerprint    TEXT NOT NULL,
+    result_json            TEXT NOT NULL,  -- 当次成功结果快照，重送原样回放
+    created_at             TEXT NOT NULL,
+    UNIQUE (returned_job_id, returned_copy_no),
+    UNIQUE (spare_job_id, spare_copy_no)
 );
 
 -- 领用记录：每次领到派工时从对应批次发出一张纸。

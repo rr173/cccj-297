@@ -42,6 +42,64 @@
 | 指定批次工单的成品只能凭**已有领用记录的派工**认定 | `receive_receipt` / `onsite_retrieve` 守卫 |
 | 各批尚未发出张数、各份承诺状态与锁定批次、从派工追溯领用批次均可查 | `GET /paper/batches`、`/jobs/{id}/commitments`、`/dispatches/{id}/withdrawal` |
 
+## 批次召回与柜台换货
+
+库管可把**已登记到货**的纸批标记为永久召回。批次只按真实交付纸张追溯：
+`delivery_items.paper_id → papers.dispatch_id → withdrawals.batch_id`；
+不读取工单允许批次、份承诺批次或当前排产。未纳入纸料追踪的旧工单没有领用
+批次，仍照旧办理。
+
+### 状态与查询
+
+* 每次真实交付都在 `copy_custody` 建立物理份持有关系。当前
+  `status='with_customer'` 的物理份若有任一张实际用纸来自召回批，就进入
+  `/recalls/pending` 待收回名单，并给出整份当前交付纸号、召回批次和原因。
+* 从未交付的份没有 custody，不进待收回名单；但召回后普通交付与授信确认都会
+  经同一个 `_check_deliverable` 守卫拒绝 `batch_recalled`。
+* 授信取件若已在本地固化交付，继续原 settle/清算；若 hold 后、确认交付前
+  遇到召回，复用既有 `release_pending → release` 路径释放额度预留，净费用
+  为零。
+* 换货只移动 custody 当前指针并追加 `copy_exchanges`；原始和各备品的
+  `delivery_items` 均只追加、不回改。查询
+  `/jobs/{job}/copies/{original_copy}/history` 可同时看到当前在手物理份、
+  待召回原因、当前交付清单、最初交付清单和历次换货快照。
+
+### 备品与换货规则
+
+* `POST /jobs/{job}/spares` 按原工单页数创建 `copy_kind='spare'` 的新份，
+  可传 `copy_count`/`copies`/`count` 与 `allowed_batches`/`batch_ids`/
+  `batches`/`batch_id`。备品仍创建槽位、原派工和 `copy_commitments`，所以
+  照常领纸、锁定批次、领用扣库存、核对和补打，并受同一库存可行性规则约束。
+* 备品只能由换货交给原工单客户；普通 `/deliver` 与授信取件返回
+  `spare_exchange_only`。
+* `POST /exchanges`（或
+  `/jobs/{job}/copies/{copy}/exchange`）提交
+  `request_id`/`exchange_request_id`、原交付份号或当前在手份号、
+  `recovered_paper_ids`、`spare_copy_no`。服务在一个 `BEGIN IMMEDIATE`
+  事务中核对：
+  * 该物理份当前确在客户手中且确因召回待收回；
+  * 纸号集合与其当前冻结交付清单完全一致（必须收回完整一份）；
+  * 备品属于同一原工单、整份每页 verified、未被其他换货使用，且实际保留纸
+    的领用批次均未召回。
+* 核对通过后，同一事务内固化备品交付、把旧物理 custody 置为 `returned`、
+  把备品 custody 指向逻辑原交付份并写入换货记录。换货不收费、不写回库/到货
+  或冲减 `withdrawals`，所以旧纸不会回库存。
+* 换货请求号幂等：成功结果保存快照，同号重送（即使该份以后又换过）返回当次
+  结果；同号改换工单号、份号、纸号或备品返回 `request_id_conflict`。退回份
+  和备品上的唯一约束、custody 部分唯一索引及全局写事务共同防止同一在手份或
+  同一备品被两次成功换货。
+* 备品后来被召回时，pending 查询沿 custody 找到的是上一次换出的物理份及其
+  `delivery_items`，因此要求收回上次的纸而不是最初的纸。
+
+本地演示（直接走领域服务和同一个 SQLite 文件，含重连/启动迁移）：
+
+```bash
+PYTHONPATH=. python -m print_center.demo.recall_demo
+```
+
+它会清空并重建 `/tmp/print_center_recall_demo/`，走完“原件 B1 召回 →
+换 B2 备品 → 重启持久化 → B2 再召回 → 换 B3 备品 → EX-1 快照重放”。
+
 ## 企业授信取件
 
 独立的**模拟财务服务**（`finance/`，可独立启动，独立 SQLite，与印制服务
@@ -107,10 +165,12 @@ print_center/
 ├── demo/
 │   ├── run_server.py  # 印制服务 uvicorn 启动入口
 │   ├── demo.py        # 可复跑端到端演示（真实子进程，含服务重启）
+│   ├── recall_demo.py # 召回/两次换货/持久化的本地可复跑演示
 │   ├── credit_demo.py # 授信取件端到端演示（印制+财务+故障代理三进程）
 │   └── fault_proxy.py # 演示用故障注入代理（复现"已生效但应答丢失"）
 └── tests/
     ├── test_service.py# 原有状态机回归测试（unittest，31 例）
+    ├── test_recall.py # 批次召回、备品、原子换货与并发回归测试
     └── test_credit.py # 财务服务与授信取件回归测试（unittest，25 例）
 ```
 
@@ -228,6 +288,17 @@ GET    /jobs/{j}/commitments                              各份承诺状态及�
 POST   /jobs/{j}/copies/{c}/reassign-batch                未开印份换批
 POST   /jobs/{j}/copies/{c}/cancel                        未开印份整份撤销
 GET    /dispatches/{d}/withdrawal                         从派工追溯领用批次
+POST   /paper/batches/{b}/recall                          库管永久召回纸批（幂等）
+GET    /recalls | /recalls/{b}                            召回记录及各批待收回份
+GET    /recalls/pending?batch_id=&job_id=                当前在手且因召回待收回的份
+GET    /paper/batches/{b}/pending                         某召回批的待收回名单
+POST   /jobs/{j}/spares | /jobs/{j}/spare-copies          按原工单补制备品并指定纸批
+GET    /jobs/{j}/spares | /spares                         备品列表/是否已具备换货条件
+POST   /exchanges | /exchange-requests                    柜台原子换货（请求号幂等）
+POST   /jobs/{j}/copies/{c}/exchange                      路径带原交付份的换货入口
+GET    /exchanges/{request_id} | /exchanges               当次换货快照/历次换货
+GET    /holdings | /copies/in-hand                        当前客户持有物理份
+GET    /jobs/{j}/copies/{c}/history                       当前在手、召回原因、历次换货
 GET    /papers | /dispatches | /investigations | /events  视图与证据链
 ```
 
@@ -246,9 +317,11 @@ GET    /ledger | /events                                  只追加资金台账�
 ## 测试
 
 ```bash
-# 原有状态机回归（31 例）+ 财务与授信取件回归（25 例）
+# 原有状态机回归（31 例）+ 财务与授信取件回归（25 例）+ 召回换货回归
 PYTHONPATH=. python -m unittest print_center.tests.test_service \
-  print_center.tests.test_credit -v
+  print_center.tests.test_credit print_center.tests.test_recall -v
+# 召回换货本地演示（无需财务服务）
+PYTHONPATH=. python -m print_center.demo.recall_demo
 # 端到端演示（真实三进程，40 项断言）
 PYTHONPATH=. python -m print_center.demo.credit_demo
 ```

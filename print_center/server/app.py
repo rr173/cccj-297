@@ -11,9 +11,11 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import connect, init_db
 from .models import (ArrivalIn, CreateJobIn, CreditPickupIn,
-                     DeactivationIn, NoPaperIn, ReassignBatchIn,
-                     ReceiptIn, ReconcilePickupIn, RegisterAgentIn,
-                     ResolveConflictIn, RetrieveIn, WasteIn)
+                     DeactivationIn, ExchangeIn, NoPaperIn,
+                     ReassignBatchIn, RecallBatchIn, ReceiptIn,
+                     ReconcilePickupIn, RegisterAgentIn,
+                     ResolveConflictIn, RetrieveIn, SpareCopiesIn,
+                     WasteIn)
 from .service import DomainError
 
 DB_PATH = os.environ.get("PRINTCENTER_DB", "/tmp/print_center/demo_server.db")
@@ -38,8 +40,11 @@ def health():
 
 @app.exception_handler(DomainError)
 async def domain_error_handler(request: Request, exc: DomainError):
-    return JSONResponse(status_code=exc.status,
-                        content={"error": exc.code, "message": exc.message})
+    content = {"error": exc.code, "message": exc.message}
+    details = getattr(exc, "details", None)
+    if details:
+        content["details"] = details
+    return JSONResponse(status_code=exc.status, content=content)
 
 
 def db(request: Request):
@@ -100,6 +105,222 @@ def cancel_copy(job_id: str, copy_no: int, request: Request):
 @app.get("/dispatches/{dispatch_id}/withdrawal")
 def dispatch_withdrawal(dispatch_id: str, request: Request):
     return service.dispatch_withdrawal(db(request), dispatch_id)
+
+
+# ---- 批次召回、备品与柜台换货 ---------------------------------------------
+
+@app.post("/paper/batches/{batch_id}/recall", status_code=201)
+@app.post("/paper/batches/{batch_id}/recalls", status_code=201)
+def recall_batch(batch_id: str, request: Request,
+                 body: Optional[RecallBatchIn] = None):
+    note = (body.note or body.reason) if body else None
+    return service.recall_batch(db(request), batch_id, note)
+
+
+@app.post("/recall", status_code=201)
+def recall_by_body(body: RecallBatchIn, request: Request):
+    if not body.batch_id:
+        raise DomainError("batch_id_required", "召回必须指定 batch_id", 400)
+    return service.recall_batch(db(request), body.batch_id,
+                                body.note or body.reason)
+
+
+@app.post("/recalls", status_code=201)
+def create_recall(body: RecallBatchIn, request: Request):
+    return recall_by_body(body, request)
+
+
+@app.post("/recalls/{batch_id}", status_code=201)
+def recall_batch_alias(batch_id: str, request: Request,
+                       body: Optional[RecallBatchIn] = None):
+    return recall_batch(batch_id, request, body)
+
+
+@app.get("/recalls/pending")
+def recalls_pending(request: Request, batch_id: Optional[str] = None,
+                    job_id: Optional[str] = None):
+    return {"pending": service.list_recall_pending(
+        db(request), batch_id=batch_id, job_id=job_id)}
+
+
+@app.get("/recall-pending")
+def recall_pending_alias(request: Request, batch_id: Optional[str] = None,
+                         job_id: Optional[str] = None):
+    return recalls_pending(request, batch_id, job_id)
+
+
+@app.get("/recall/queue")
+def recall_queue_alias(request: Request, batch_id: Optional[str] = None,
+                       job_id: Optional[str] = None):
+    return recalls_pending(request, batch_id, job_id)
+
+
+@app.get("/recall/pending")
+def recall_pending_slash_alias(request: Request,
+                               batch_id: Optional[str] = None,
+                               job_id: Optional[str] = None):
+    return recalls_pending(request, batch_id, job_id)
+
+
+@app.get("/recall-list")
+def recall_list_alias(request: Request, batch_id: Optional[str] = None,
+                      job_id: Optional[str] = None):
+    return recalls_pending(request, batch_id, job_id)
+
+
+@app.get("/paper/batches/{batch_id}/pending")
+def batch_pending(batch_id: str, request: Request):
+    return {"batch_id": batch_id,
+            "pending": service.list_recall_pending(
+                db(request), batch_id=batch_id)}
+
+
+@app.get("/recalls")
+def recalls(request: Request):
+    return {"recalls": service.list_recalls(db(request))}
+
+
+@app.get("/recall-dashboard")
+def recall_dashboard(request: Request, job_id: Optional[str] = None):
+    return service.recall_dashboard(db(request), job_id)
+
+
+@app.get("/recalls/{batch_id}")
+def recall_detail(batch_id: str, request: Request):
+    return service.get_recall(db(request), batch_id)
+
+
+@app.get("/recalls/{batch_id}/pending")
+def recall_detail_pending(batch_id: str, request: Request):
+    return {"batch_id": batch_id,
+            "pending": service.list_recall_pending(
+                db(request), batch_id=batch_id)}
+
+
+@app.post("/jobs/{job_id}/spares", status_code=201)
+@app.post("/jobs/{job_id}/spare", status_code=201)
+@app.post("/jobs/{job_id}/spare-copies", status_code=201)
+def create_spares(job_id: str, request: Request,
+                  body: Optional[SpareCopiesIn] = None):
+    data = body.model_dump(exclude_none=True) if body is not None else {}
+    return service.create_spare_copies(db(request), job_id, **data)
+
+
+@app.get("/jobs/{job_id}/spares")
+def list_spares(job_id: str, request: Request,
+                only_available: bool = False):
+    return service.list_spare_copies(
+        db(request), job_id, only_available=only_available)
+
+
+@app.get("/spares")
+def all_spares(request: Request, only_available: bool = False):
+    return service.list_spare_copies(
+        db(request), None, only_available=only_available)
+
+
+def _exchange_kwargs(body: ExchangeIn, job_id: Optional[str] = None,
+                     copy_no: Optional[int] = None) -> dict:
+    data = body.model_dump(exclude_none=True)
+    request_id = (data.pop("request_id", None)
+                  or data.pop("exchange_request_id", None)
+                  or data.pop("exchange_request_no", None)
+                  or data.pop("request_no", None)
+                  or data.pop("idempotency_key", None)
+                  or data.pop("exchange_id", None))
+    recovered = (data.pop("recovered_paper_ids", None)
+                 or data.pop("returned_paper_ids", None)
+                 or data.pop("recovered_papers", None)
+                 or data.pop("papers", None)
+                 or data.pop("paper_ids", None))
+    original = (data.pop("original_copy_no", None)
+                or data.pop("original_copy", None)
+                or data.pop("original_copy_id", None)
+                or data.pop("copy_id", None)
+                or data.pop("copy_no", None) or copy_no)
+    spare = (data.pop("spare_copy_no", None)
+             or data.pop("spare_no", None)
+             or data.pop("spare_id", None)
+             or data.pop("spare_copy_id", None))
+    returned = (data.pop("returned_copy_no", None)
+                or data.pop("held_copy_no", None)
+                or data.pop("current_copy_no", None))
+    body_job = data.pop("job_id", None) or job_id
+    # 其余 note 等字段不进入领域函数。
+    return {"request_id": request_id, "job_id": body_job,
+            "original_copy_no": original,
+            "returned_copy_no": returned,
+            "spare_copy_no": spare,
+            "recovered_paper_ids": recovered}
+
+
+@app.post("/exchanges", status_code=201)
+@app.post("/exchange", status_code=201)
+@app.post("/exchange-requests", status_code=201)
+@app.post("/counter-exchange", status_code=201)
+@app.post("/counter/exchange", status_code=201)
+@app.post("/recalls/exchange", status_code=201)
+def create_exchange(body: ExchangeIn, request: Request):
+    return service.exchange_copy(
+        db(request), **_exchange_kwargs(body))
+
+
+@app.post("/jobs/{job_id}/copies/{copy_no}/exchange", status_code=201)
+@app.post("/jobs/{job_id}/copies/{copy_no}/exchanges", status_code=201)
+def exchange_for_copy(job_id: str, copy_no: int, body: ExchangeIn,
+                      request: Request):
+    return service.exchange_copy(
+        db(request), **_exchange_kwargs(body, job_id, copy_no))
+
+
+@app.get("/exchanges")
+def list_exchanges(request: Request, job_id: Optional[str] = None,
+                   copy_no: Optional[int] = None):
+    return {"exchanges": service.list_copy_exchanges(
+        db(request), job_id, copy_no)}
+
+
+@app.get("/exchanges/{request_id}")
+@app.get("/exchange-requests/{request_id}")
+@app.get("/counter-exchanges/{request_id}")
+def exchange_detail(request_id: str, request: Request):
+    return service.get_exchange(db(request), request_id)
+
+
+@app.get("/holdings")
+def holdings(request: Request, job_id: Optional[str] = None,
+             include_returned: bool = False):
+    return service.list_holdings(
+        db(request), job_id, include_returned=include_returned)
+
+
+@app.get("/copies/in-hand")
+def copies_in_hand(request: Request, job_id: Optional[str] = None):
+    return service.list_holdings(db(request), job_id)
+
+
+@app.get("/counter-exchanges")
+def counter_exchanges(request: Request, job_id: Optional[str] = None,
+                      copy_no: Optional[int] = None):
+    return list_exchanges(request, job_id, copy_no)
+
+
+@app.get("/jobs/{job_id}/holdings")
+def job_holdings(job_id: str, request: Request,
+                 include_returned: bool = False):
+    return service.list_holdings(
+        db(request), job_id, include_returned=include_returned)
+
+
+@app.get("/jobs/{job_id}/copies/{copy_no}/current-delivery-list")
+def current_delivery_list(job_id: str, copy_no: int, request: Request):
+    return service.current_delivery_list(db(request), job_id, copy_no)
+
+
+@app.get("/jobs/{job_id}/copies/{copy_no}/recall-view")
+@app.get("/jobs/{job_id}/copies/{copy_no}/history")
+def copy_recall_view(job_id: str, copy_no: int, request: Request):
+    return service.get_copy_recall_view(db(request), job_id, copy_no)
 
 
 # ---- 代理 ----------------------------------------------------------------

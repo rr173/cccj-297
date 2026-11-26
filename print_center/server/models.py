@@ -75,3 +75,58 @@ class WasteIn(BaseModel):
 class ResolveConflictIn(BaseModel):
     keep_paper_id: Optional[str] = None
     note: Optional[str] = None
+
+
+class RecallBatchIn(BaseModel):
+    batch_id: Optional[str] = None
+    note: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class SpareCopiesIn(BaseModel):
+    # 兼容不同调用命名；service 层统一归一化。
+    copy_count: Optional[int] = Field(default=None, gt=0)
+    copies: Optional[int] = Field(default=None, gt=0)
+    copies_count: Optional[int] = Field(default=None, gt=0)
+    count: Optional[int] = Field(default=None, gt=0)
+    quantity: Optional[int] = Field(default=None, gt=0)
+    n: Optional[int] = Field(default=None, gt=0)
+    spare_count: Optional[int] = Field(default=None, gt=0)
+    page_count: Optional[int] = Field(default=None, gt=0)
+    pages: Optional[int] = Field(default=None, gt=0)
+    number_of_copies: Optional[int] = Field(default=None, gt=0)
+    allowed_batches: Optional[list[str]] = None
+    batch_ids: Optional[list[str]] = None
+    batches: Optional[list[str]] = None
+    batch_id: Optional[str] = None
+    note: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ExchangeIn(BaseModel):
+    # 路径中已有 job_id/copy_no 时，这些字段均可由路由补齐。
+    request_id: Optional[str] = Field(default=None, min_length=1)
+    exchange_request_id: Optional[str] = Field(default=None, min_length=1)
+    exchange_request_no: Optional[str] = Field(default=None, min_length=1)
+    request_no: Optional[str] = Field(default=None, min_length=1)
+    exchange_id: Optional[str] = Field(default=None, min_length=1)
+    idempotency_key: Optional[str] = Field(default=None, min_length=1)
+    job_id: Optional[str] = None
+    copy_no: Optional[int] = Field(default=None, gt=0)
+    original_copy_no: Optional[int] = Field(default=None, gt=0)
+    original_copy: Optional[int] = Field(default=None, gt=0)
+    original_copy_id: Optional[str] = None
+    copy_id: Optional[str] = None
+    returned_copy_no: Optional[int] = Field(default=None, gt=0)
+    held_copy_no: Optional[int] = Field(default=None, gt=0)
+    current_copy_no: Optional[int] = Field(default=None, gt=0)
+    spare_copy_no: Optional[int] = Field(default=None, gt=0)
+    spare_no: Optional[int] = Field(default=None, gt=0)
+    spare_id: Optional[str] = None
+    spare_copy_id: Optional[str] = None
+    recovered_paper_ids: Optional[list] = None
+    returned_paper_ids: Optional[list] = None
+    paper_ids: Optional[list] = None
+    recovered_papers: Optional[list] = None
+    papers: Optional[list] = None
+    note: Optional[str] = None
