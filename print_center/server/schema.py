@@ -10,6 +10,17 @@
   同一张纸全局唯一，且每个槽位最终至多保留一张有效纸。
 * 交付后 ``delivery_items`` 只追加、不回改；之后出现的矛盾写入
   ``investigations``。
+
+纸料承诺扩展
+============
+* ``stock_arrivals`` 记录库管按批次登记的到货张数（只追加，同批可再入库）；
+  ``withdrawals`` 记录每次领活时从对应批次发出的一张纸（只追加）。
+  库内可用 = 到货合计 − 已发出合计；核对/判废/停用/回执都不写这两张表，
+  因此库存不会被恢复也不会被重复扣减。
+* ``job_batch_policies`` 是工单允许使用的批次；没有该表记录的工单走旧流程，
+  不参与纸料账。
+* ``copy_commitments`` 是份级承诺：planned（未开印，可换批/撤销）→
+  locked（首次领活时锁定批次）或 cancelled（撤销，不再派工/交付）。
 """
 
 SCHEMA_SQL = """
@@ -41,9 +52,10 @@ CREATE TABLE IF NOT EXISTS job_copies (
     copy_no       INTEGER NOT NULL CHECK (copy_no >= 1),
     status        TEXT NOT NULL DEFAULT 'pending'
                   -- pending 待处理 / ready 可交付 / delivered 已交付 /
-                  -- paused 因矛盾暂停 / investigating 交付后追查
+                  -- paused 因矛盾暂停 / investigating 交付后追查 /
+                  -- cancelled 已撤销（不再派工或交付）
                   CHECK (status IN ('pending','ready','delivered',
-                                    'paused','investigating')),
+                                    'paused','investigating','cancelled')),
     paused_reason TEXT,
     PRIMARY KEY (job_id, copy_no)
 );
@@ -76,10 +88,11 @@ CREATE TABLE IF NOT EXISTS dispatches (
     attempt_no    INTEGER NOT NULL,              -- 1=原派工，2+=补派
     agent_id      TEXT REFERENCES agents(agent_id),
     -- queued 待领取 / claimed 已领取（结果未知）/
-    -- receipted 已收回执 / deactivated 代理已停用该派工
+    -- receipted 已收回执 / deactivated 代理已停用该派工 /
+    -- cancelled 所属份已撤销，永不再派
     status        TEXT NOT NULL DEFAULT 'queued'
                   CHECK (status IN ('queued','claimed','receipted',
-                                    'deactivated')),
+                                    'deactivated','cancelled')),
     created_at    TEXT NOT NULL,
     claimed_at    TEXT,
     receipted_at  TEXT,
@@ -165,6 +178,50 @@ CREATE TABLE IF NOT EXISTS investigations (
     resolved      INTEGER NOT NULL DEFAULT 0
 );
 
+-- 批次到货登记（只追加；同一批可多次入库，未到货的批次不在表中=零库存）
+CREATE TABLE IF NOT EXISTS stock_arrivals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL,
+    sheets        INTEGER NOT NULL CHECK (sheets > 0),
+    note          TEXT,
+    created_at    TEXT NOT NULL
+);
+
+-- 工单允许使用的批次编号（存在记录 = 该工单参与纸料账）
+CREATE TABLE IF NOT EXISTS job_batch_policies (
+    job_id        TEXT NOT NULL REFERENCES jobs(job_id),
+    batch_id      TEXT NOT NULL,
+    PRIMARY KEY (job_id, batch_id)
+);
+
+-- 份级纸料承诺：每份当前计划/锁定使用的批次
+CREATE TABLE IF NOT EXISTS copy_commitments (
+    job_id        TEXT NOT NULL REFERENCES jobs(job_id),
+    copy_no       INTEGER NOT NULL,
+    -- planned 未开印（可换批/撤销）/ locked 首次领活后锁定 /
+    -- cancelled 已撤销
+    status        TEXT NOT NULL DEFAULT 'planned'
+                  CHECK (status IN ('planned','locked','cancelled')),
+    batch_id      TEXT NOT NULL,
+    locked_at     TEXT,
+    cancelled_at  TEXT,
+    PRIMARY KEY (job_id, copy_no)
+);
+
+-- 领用记录：每次领到派工时从对应批次发出一张纸。
+-- 只追加、永不回改；与派工状态变更在同一事务内生效。
+CREATE TABLE IF NOT EXISTS withdrawals (
+    withdrawal_id TEXT PRIMARY KEY,
+    dispatch_id   TEXT NOT NULL UNIQUE REFERENCES dispatches(dispatch_id),
+    batch_id      TEXT NOT NULL,
+    job_id        TEXT NOT NULL,
+    copy_no       INTEGER NOT NULL,
+    page_no       INTEGER NOT NULL,
+    attempt_no    INTEGER NOT NULL,
+    agent_id      TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
 -- 全量事件日志（证据链）
 CREATE TABLE IF NOT EXISTS event_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,4 +236,8 @@ CREATE INDEX IF NOT EXISTS idx_papers_slot
     ON papers(job_id, copy_no, page_no);
 CREATE INDEX IF NOT EXISTS idx_slots_status
     ON page_slots(job_id, copy_no, status);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_batch
+    ON withdrawals(batch_id);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_slot
+    ON withdrawals(job_id, copy_no, page_no);
 """

@@ -11,6 +11,17 @@ class CreateJobIn(BaseModel):
     title: str = Field(..., min_length=1)
     page_count: int = Field(..., gt=0)
     copy_count: int = Field(..., gt=0)
+    # 指定允许使用的批次编号；缺省/null = 旧流程，不参与纸料账
+    allowed_batches: Optional[list[str]] = None
+
+
+class ArrivalIn(BaseModel):
+    sheets: int = Field(..., gt=0)
+    note: Optional[str] = None
+
+
+class ReassignBatchIn(BaseModel):
+    batch_id: str = Field(..., min_length=1)
 
 
 class RegisterAgentIn(BaseModel):

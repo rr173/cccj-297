@@ -16,6 +16,13 @@ A. 代理在"纸张已产出、回执未发"时退出（核心场景）-> 重启
 B. 停用见证 -> 现场找回成品 -> 判废 -> 补打 -> 旧派工晚回执撞废页
    -> 隔离+追查 -> 现场选页 -> 交付；
 C. 交付后旧派工晚回执制造矛盾：交付清单不回改，只立追查。
+D. 纸料承诺：批次到货 -> 库存总数相同但能否接单不同（同份须同批）
+   -> 未到货批次按零库存 -> 各批账面查询；
+E. 未开印份换批（守卫+补货后成功）-> 整份撤销（不再派工/交付）
+   -> 首次领活锁定批次 -> 从派工追溯领用批次 -> 交付；
+F. 首张没印出来也锁定批次 -> 补打只吃余量、缺纸不挡已接工单原印
+   -> 服务重启后承诺与领用仍有效 -> 同批补纸后续打 -> 交付，
+   全程展示发出的纸不再回库。
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ PORT = free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 ROOT = Path(__file__).resolve().parents[2]          # .../print_center 的上级
 STATE = Path(os.environ.get("DEMO_STATE", "/tmp/print_center_demo"))
+SERVER: dict = {"proc": None, "log": None}
 
 PASS, FAIL, INFO = "PASS", "FAIL", "INFO"
 results: list[tuple[str, str, str]] = []
@@ -82,6 +90,11 @@ def title_of(code: str) -> str:
         "slot_is_waste": "废页槽位不能直接找回交付",
         "already_delivered": "已交付份不可重复交付",
         "agent_mismatch": "非原代理不能操作派工",
+        "insufficient_stock": "纸料不足整单不建并说明缺料",
+        "copy_cancelled": "已撤销份不再派工或交付",
+        "copy_already_locked": "已开印份批次已锁定，不可换批/撤销",
+        "batch_not_allowed": "批次不在工单允许范围",
+        "no_withdrawal_record": "无领用记录的派工不能认定成品",
     }.get(code, code)
 
 
@@ -121,16 +134,46 @@ def wait_healthy(timeout: float = 15) -> None:
 
 
 def start_server():
+    """（重）启动服务端：同一数据库文件，新端口。返回进程。"""
+    global BASE, PORT
+    PORT = free_port()
+    BASE = f"http://127.0.0.1:{PORT}"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
     env["PRINTCENTER_DB"] = str(STATE / "server" / "print_center.db")
     env["PRINTCENTER_PORT"] = str(PORT)
-    log = open(STATE / "server" / "uvicorn.log", "w")
+    if SERVER["log"] is None:
+        SERVER["log"] = open(STATE / "server" / "uvicorn.log", "w")
     proc = subprocess.Popen(
         [sys.executable, "-m", "print_center.demo.run_server"],
-        cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT)
+        cwd=str(ROOT), env=env,
+        stdout=SERVER["log"], stderr=subprocess.STDOUT)
+    SERVER["proc"] = proc
     wait_healthy()
-    return proc, log
+    return proc
+
+
+def restart_server():
+    """模拟服务重启：杀掉进程后用同一数据库文件重新拉起。"""
+    SERVER["proc"].terminate()
+    try:
+        SERVER["proc"].wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        SERVER["proc"].kill()
+        SERVER["proc"].wait(timeout=5)
+    start_server()
+
+
+def stop_server():
+    proc = SERVER["proc"]
+    if proc is not None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if SERVER["log"] is not None:
+        SERVER["log"].close()
 
 
 def slot_view(job: str, copy_no: int, page_no: int) -> dict:
@@ -405,14 +448,250 @@ def scenario_c_waste_then_late_after_reprint():
     return JOB
 
 
+def batches_map() -> dict:
+    return {b["batch_id"]: b
+            for b in api("GET", "/paper/batches")["batches"]}
+
+
+def scenario_d_stock_and_acceptance():
+    print("\n=== 场景 D：批次到货、库存总数相同但能否接单不同、未到货零库存 ===")
+    # 库管按批次登记到货张数
+    api("POST", "/paper/batches/B1/arrivals", {"sheets": 3, "note": "首批"})
+    api("POST", "/paper/batches/B2/arrivals", {"sheets": 3})
+    b = batches_map()
+    check("到货登记后各批尚未发出张数可查",
+          b["B1"]["available"] == 3 and b["B2"]["available"] == 3
+          and b["B1"]["withdrawn"] == 0,
+          json.dumps([b["B1"], b["B2"]], ensure_ascii=False))
+
+    # 库存总数 6、需求总数也是 6：3 份×2 页因"同份须同批"装不下
+    r = api("POST", "/jobs", {
+        "job_id": "JOB-D-REJ", "title": "三折页", "page_count": 2,
+        "copy_count": 3, "allowed_batches": ["B1", "B2"]},
+        expect_error="insufficient_stock")
+    check("拒单说明缺料（各批账面+总量够但整份不可拆）",
+          "整单未建" in r["message"] and "批次 B1" in r["message"]
+          and "同一份必须用同一批" in r["message"],
+          r["message"])
+    check("拒单不建单", api("GET", "/jobs/JOB-D-REJ",
+                            expect_error="job_not_found") is not None)
+
+    # 同样的库存总数、同样的需求总数：2 份×3 页可以接
+    api("POST", "/jobs", {
+        "job_id": "JOB-D1", "title": "产品手册", "page_count": 3,
+        "copy_count": 2, "allowed_batches": ["B1", "B2"]})
+    cm = api("GET", "/jobs/JOB-D1/commitments")
+    assign = {c["copy_no"]: c["commitment"]["batch_id"]
+              for c in cm["copies"]}
+    check("库存总数相同但能否接单不同：2×3 被受理，两份各落一批",
+          assign == {1: "B1", 2: "B2"}, json.dumps(assign))
+    check("各份承诺状态为 planned（未开印，未锁定）",
+          all(c["commitment"]["status"] == "planned"
+              for c in cm["copies"]))
+    b = batches_map()
+    check("接单后各批已承诺原印 3 张、尚未发出仍为 3 张",
+          b["B1"]["committed_original"] == 3
+          and b["B2"]["committed_original"] == 3
+          and b["B1"]["available"] == 3)
+
+    # 未到货的批次按零库存看待
+    r = api("POST", "/jobs", {
+        "job_id": "JOB-D-ZERO", "title": "单页", "page_count": 1,
+        "copy_count": 1, "allowed_batches": ["B9"]},
+        expect_error="insufficient_stock")
+    check("未到货批次按零库存参与缺料说明",
+          "B9" in r["message"] and "可用 0" in r["message"], r["message"])
+    return "JOB-D1"
+
+
+def scenario_e_reassign_cancel_lock(job: str):
+    print("\n=== 场景 E：未开印份换批/撤销，首次领活锁定批次，派工追溯批次 ===")
+    # 换批守卫：B2 已被 copy2 占满（3/3），换入 copy1 还需 3 张
+    api("POST", f"/jobs/{job}/copies/1/reassign-batch", {"batch_id": "B2"},
+        expect_error="insufficient_stock")
+    # 同一批可再入库
+    api("POST", "/paper/batches/B2/arrivals",
+        {"sheets": 3, "note": "同批补入"})
+    r = api("POST", f"/jobs/{job}/copies/1/reassign-batch",
+            {"batch_id": "B2"})
+    moved = {c["copy_no"]: c["commitment"]["batch_id"]
+             for c in r["copies"]}
+    check("同批补货后未开印份换批成功", moved[1] == "B2",
+          json.dumps(moved))
+    api("POST", f"/jobs/{job}/copies/1/reassign-batch", {"batch_id": "B9"},
+        expect_error="batch_not_allowed")
+
+    # 整份撤销：不再派工或交付
+    r = api("POST", f"/jobs/{job}/copies/2/cancel", {})
+    check("整份撤销后承诺状态为 cancelled",
+          r["copies"][1]["commitment"]["status"] == "cancelled")
+    dispatches = api("GET", f"/dispatches?job_id={job}")["dispatches"]
+    check("撤销份的派工全部取消（不再派工）",
+          all(d["status"] == "cancelled" for d in dispatches
+              if d["copy_no"] == 2))
+    api("POST", f"/jobs/{job}/copies/2/deliver", {},
+        expect_error="copy_cancelled")
+    b = batches_map()
+    check("撤销释放承诺用纸（B2 承诺从 6 降回 3）",
+          b["B2"]["committed_original"] == 3)
+
+    # 代理第一次领到该份页任务 -> 对外锁定批次；领用与派工一起生效
+    before = batches_map()["B2"]["available"]
+    run_agent("agent-E1", "e1.db", "work", "--max-jobs", "1")
+    cm = api("GET", f"/jobs/{job}/commitments")
+    c1 = cm["copies"][0]["commitment"]
+    check("首次领活后该份锁定批次",
+          c1["status"] == "locked" and c1["batch_id"] == "B2",
+          json.dumps(c1, ensure_ascii=False))
+    after = batches_map()["B2"]
+    check("领用与派工一起生效：B2 恰好少一张且只少一张",
+          after["available"] == before - 1 and after["withdrawn"] == 1)
+    d1 = next(d for d in api("GET", f"/dispatches?job_id={job}")[
+        "dispatches"] if d["copy_no"] == 1 and d["status"] != "queued")
+    w = api("GET", f"/dispatches/{d1['dispatch_id']}/withdrawal")
+    check("从派工追溯领用批次",
+          w["withdrawal"]["batch_id"] == "B2",
+          json.dumps(w["withdrawal"], ensure_ascii=False))
+    # 已开印的份不能再换批/撤销
+    api("POST", f"/jobs/{job}/copies/1/reassign-batch", {"batch_id": "B1"},
+        expect_error="copy_already_locked")
+    api("POST", f"/jobs/{job}/copies/1/cancel", {},
+        expect_error="copy_already_locked")
+
+    # 剩余原印仍同批，完成后交付 copy1
+    run_agent("agent-E1", "e1.db", "work", "--max-jobs", "5")
+    papers = api("GET", f"/papers?job_id={job}")["papers"]
+    check("该份全部原印纸都来自锁定批次 B2 的领用",
+          all(api("GET", f"/dispatches/{p['dispatch_id']}/withdrawal")[
+              "withdrawal"]["batch_id"] == "B2" for p in papers))
+    for p in papers:
+        api("POST", f"/jobs/{job}/copies/1/pages/{p['page_no']}/retrieve",
+                    {"paper_id": p["paper_id"]})
+    dl = api("POST", f"/jobs/{job}/copies/1/deliver", {})
+    check("换批后的份正常交付", len(dl["items"]) == 3)
+
+
+def scenario_f_reprint_starvation_and_restart():
+    print("\n=== 场景 F：补打缺纸不挡原印、重启后承诺有效、同批补纸续打 ===")
+    api("POST", "/paper/batches/B3/arrivals", {"sheets": 4})
+    api("POST", "/paper/batches/B4/arrivals", {"sheets": 3})
+    api("POST", "/jobs", {
+        "job_id": "JOB-F1", "title": "手册", "page_count": 3,
+        "copy_count": 1, "allowed_batches": ["B3", "B4"]})
+    cm = api("GET", "/jobs/JOB-F1/commitments")
+    check("新单落到首批可用的批次 B3",
+          cm["copies"][0]["commitment"]["batch_id"] == "B3")
+
+    # 首张领取即锁定 B3——哪怕这张纸最终没印出来（出纸前失联）
+    run_agent("agent-F1", "f1.db", "work", "--max-jobs", "1",
+              "--crash", "after_claim", expect_exit=3)
+    cm = api("GET", "/jobs/JOB-F1/commitments")
+    check("首张没印出来，批次依然锁定 B3",
+          cm["copies"][0]["commitment"]["status"] == "locked"
+          and cm["copies"][0]["commitment"]["batch_id"] == "B3")
+    d1 = next(d for d in api("GET", "/dispatches?job_id=JOB-F1")[
+        "dispatches"] if d["page_no"] == 1 and d["attempt_no"] == 1)
+    w = api("GET", f"/dispatches/{d1['dispatch_id']}/withdrawal")
+    check("首张虽未印出，领用已生效且永不回库",
+          w["withdrawal"]["batch_id"] == "B3"
+          and batches_map()["B3"]["withdrawn"] == 1)
+
+    # 停用 -> 未出纸 -> 补打（原有核对规则不变）
+    run_agent("agent-F1", "f1.db", "deactivate", d1["dispatch_id"])
+    api("POST", "/jobs/JOB-F1/copies/1/pages/1/no-paper", {})
+    rp = api("POST", "/jobs/JOB-F1/copies/1/pages/1/reprint", {})
+    check("补打仍按原有核对规则申请", rp["attempt_no"] == 2)
+    b3 = batches_map()["B3"]
+    check("停用/未出纸/判废都不恢复库存也不再次扣减",
+          b3["available"] == 3 and b3["withdrawn"] == 1)
+
+    # 领完剩余原印（承诺内），补打吃掉最后一张余量
+    run_agent("agent-F1", "f1.db", "work", "--max-jobs", "3")
+    b3 = batches_map()["B3"]
+    check("原印 3 张 + 补打 1 张全部发出，B3 恰好清零",
+          b3["withdrawn"] == 4 and b3["available"] == 0,
+          json.dumps(b3))
+    # 补打纸判废 -> 再补打 -> B3 缺料
+    p1a2 = next(p for p in api("GET", "/papers?job_id=JOB-F1")["papers"]
+                if p["page_no"] == 1)
+    api("POST", "/jobs/JOB-F1/copies/1/pages/1/waste",
+        {"paper_id": p1a2["paper_id"], "note": "蹭脏"})
+    rp3 = api("POST", "/jobs/JOB-F1/copies/1/pages/1/reprint", {})
+    # 新工单用 B4 照常受理；只用 B3 的单因缺料被拒
+    api("POST", "/jobs", {
+        "job_id": "JOB-F2", "title": "插页", "page_count": 3,
+        "copy_count": 1, "allowed_batches": ["B4"]})
+    api("POST", "/jobs", {
+        "job_id": "JOB-F3", "title": "单页", "page_count": 1,
+        "copy_count": 1, "allowed_batches": ["B3"]},
+        expect_error="insufficient_stock")
+
+    # 缺料的补打继续等待，不挡住其他可领任务（F2 原印照常兑现）
+    run_agent("agent-F1", "f1.db", "work", "--max-jobs", "5")
+    dispatches = api("GET", "/dispatches?job_id=JOB-F1")["dispatches"]
+    starved = next(d for d in dispatches
+                   if d["dispatch_id"] == rp3["dispatch_id"])
+    f2_done = api("GET", "/dispatches?job_id=JOB-F2")["dispatches"]
+    check("缺料补打继续等待，不挡其他可领任务",
+          starved["status"] == "queued"
+          and all(d["status"] == "receipted" for d in f2_done))
+    originals = [d for d in dispatches if d["attempt_no"] == 1]
+    check("已接工单在补打缺纸时仍兑现全部原印（张张有领用）",
+          all(api("GET", f"/dispatches/{d['dispatch_id']}/withdrawal")[
+              "withdrawal"] is not None for d in originals))
+
+    # 服务重启：承诺与领用仍然有效
+    restart_server()
+    cm = api("GET", "/jobs/JOB-F1/commitments")
+    b3 = batches_map()["B3"]
+    starved_after = next(d for d in api(
+        "GET", "/dispatches?job_id=JOB-F1")["dispatches"]
+        if d["dispatch_id"] == rp3["dispatch_id"])
+    check("重启后承诺与领用仍有效",
+          cm["copies"][0]["commitment"]["status"] == "locked"
+          and b3["withdrawn"] == 4 and b3["available"] == 0
+          and starved_after["status"] == "queued")
+
+    # 同批补入足够纸后，缺料补打继续（且仍只用锁定的 B3）
+    api("POST", "/paper/batches/B3/arrivals",
+        {"sheets": 1, "note": "同批补入"})
+    run_agent("agent-F1", "f1.db", "work", "--max-jobs", "5")
+    w = api("GET", f"/dispatches/{rp3['dispatch_id']}/withdrawal")
+    check("补打恢复后仍只用锁定批次",
+          w["withdrawal"] is not None
+          and w["withdrawal"]["batch_id"] == "B3")
+
+    # 现场核对 + 交付 F1/F2
+    for job in ("JOB-F1", "JOB-F2"):
+        for p in api("GET", f"/papers?job_id={job}")["papers"]:
+            if p["state"] in ("candidate", "attest"):
+                api("POST",
+                    f"/jobs/{job}/copies/1/pages/{p['page_no']}/retrieve",
+                    {"paper_id": p["paper_id"]})
+        dl = api("POST", f"/jobs/{job}/copies/1/deliver", {})
+        check(f"{job} 整份交付", len(dl["items"]) == 3)
+    b = batches_map()
+    check("发出的纸不再回库：B3 到货5/发出5/可用0，B4 到货3/发出3/可用0",
+          b["B3"]["arrived"] == 5 and b["B3"]["withdrawn"] == 5
+          and b["B3"]["available"] == 0
+          and b["B4"]["arrived"] == 3 and b["B4"]["withdrawn"] == 3,
+          json.dumps([b["B3"], b["B4"]], ensure_ascii=False))
+
+
+
 def show_evidence():
     print("\n=== 证据与视图（服务端事件日志节选） ===")
     events = api("GET", "/events?limit=12")["events"]
     for e in events[:12]:
         print(f"  {e['ts']}  {e['kind']}  {e['payload'][:110]}")
+    print("\n=== 纸料账面（各批尚未发出张数） ===")
+    for b in api("GET", "/paper/batches")["batches"]:
+        print(f"  {b['batch_id']}: 到货 {b['arrived']} 已发出 "
+              f"{b['withdrawn']} 库内可用 {b['available']} "
+              f"已承诺原印 {b['committed_original']}")
     print(f"\n数据库位置：")
     print(f"  服务端（只读视图来源）: {STATE / 'server' / 'print_center.db'}")
-    for name in ("a1.db", "b1.db", "b2.db", "c1.db"):
+    for name in ("a1.db", "b1.db", "b2.db", "c1.db", "e1.db", "f1.db"):
         print(f"  代理本地介质（服务端不可读）: {STATE / 'agents' / name}")
 
 
@@ -422,20 +701,18 @@ def main() -> int:
     (STATE / "server").mkdir(parents=True)
     (STATE / "agents").mkdir(parents=True)
 
-    proc, log = start_server()
+    start_server()
     print(f"演示服务端已启动：{BASE}（状态目录 {STATE}）", flush=True)
     try:
         scenario_a_crash_before_receipt()
         scenario_b_waste_and_late_receipt()
         scenario_c_waste_then_late_after_reprint()
+        job_d1 = scenario_d_stock_and_acceptance()
+        scenario_e_reassign_cancel_lock(job_d1)
+        scenario_f_reprint_starvation_and_restart()
         show_evidence()
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        log.close()
+        stop_server()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n{'='*60}\n演示断言：{len(results) - len(failed)} 通过，"

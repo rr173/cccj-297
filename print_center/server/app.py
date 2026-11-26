@@ -10,9 +10,9 @@ from fastapi.responses import JSONResponse
 
 from . import service
 from .db import connect, init_db
-from .models import (CreateJobIn, DeactivationIn, NoPaperIn,
-                     ReceiptIn, RegisterAgentIn, ResolveConflictIn,
-                     RetrieveIn, WasteIn)
+from .models import (ArrivalIn, CreateJobIn, DeactivationIn, NoPaperIn,
+                     ReassignBatchIn, ReceiptIn, RegisterAgentIn,
+                     ResolveConflictIn, RetrieveIn, WasteIn)
 from .service import DomainError
 
 DB_PATH = os.environ.get("PRINTCENTER_DB", "/tmp/print_center/demo_server.db")
@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     app.state.db.close()
 
 
-app = FastAPI(title="小型印制中心续打服务", version="1.0",
+app = FastAPI(title="小型印制中心续打服务", version="1.1",
               lifespan=lifespan)
 
 
@@ -51,12 +51,52 @@ def db(request: Request):
 def create_job(body: CreateJobIn, request: Request):
     return service.create_job(
         db(request), body.job_id, body.title,
-        body.page_count, body.copy_count)
+        body.page_count, body.copy_count, body.allowed_batches)
 
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, request: Request):
     return service.get_job(db(request), job_id)
+
+
+# ---- 纸料批次与承诺 --------------------------------------------------------
+
+@app.post("/paper/batches/{batch_id}/arrivals", status_code=201)
+def arrival(batch_id: str, body: ArrivalIn, request: Request):
+    return service.register_arrival(
+        db(request), batch_id, body.sheets, body.note)
+
+
+@app.get("/paper/batches")
+def batches(request: Request):
+    return {"batches": service.list_batches(db(request))}
+
+
+@app.get("/paper/batches/{batch_id}")
+def batch(batch_id: str, request: Request):
+    return service.batch_view(db(request), batch_id)
+
+
+@app.get("/jobs/{job_id}/commitments")
+def commitments(job_id: str, request: Request):
+    return service.job_commitments(db(request), job_id)
+
+
+@app.post("/jobs/{job_id}/copies/{copy_no}/reassign-batch")
+def reassign_batch(job_id: str, copy_no: int, body: ReassignBatchIn,
+                   request: Request):
+    return service.reassign_copy_batch(
+        db(request), job_id, copy_no, body.batch_id)
+
+
+@app.post("/jobs/{job_id}/copies/{copy_no}/cancel")
+def cancel_copy(job_id: str, copy_no: int, request: Request):
+    return service.cancel_copy(db(request), job_id, copy_no)
+
+
+@app.get("/dispatches/{dispatch_id}/withdrawal")
+def dispatch_withdrawal(dispatch_id: str, request: Request):
+    return service.dispatch_withdrawal(db(request), dispatch_id)
 
 
 # ---- 代理 ----------------------------------------------------------------
